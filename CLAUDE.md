@@ -1,0 +1,40 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+redmount mounts one Redmine project as a Windows drive via WinFsp (Rust, edition 2024, Windows/MSVC only). See README.md for the user-facing file layout and write semantics.
+
+## Commands
+
+```powershell
+cargo build                     # needs WinFsp 2.1+ installed and VS Build Tools (C++)
+cargo test                      # unit tests (markdown round-trip, fs name/time helpers)
+cargo test roundtrip_multibyte  # single test by name
+$env:REDMINE_API_KEY = "..."; cargo run --release -- --url https://redmine.example.com --project myproj --mount R:
+```
+
+`build.rs` delay-loads `winfsp-x64.dll`; `main.rs` prepends `%ProgramFiles(x86)%\WinFsp\bin` to `PATH` before `winfsp_init`.
+
+## Architecture
+
+Three layers, one file each:
+
+- `src/redmine.rs`: blocking `reqwest` REST client (`Api`) + serde models (`Issue`, `Journal`, `Attachment`, `Meta`). `Meta` (trackers, statuses, priorities, users, categories, versions, custom fields) is fetched once at mount and used to map names to IDs. Restart to pick up new members or versions.
+- `src/markdown.rs`: `issue.md` / `comment_N.md` text <-> Redmine payloads. YAML front matter holds editable fields; everything after `RO_MARK` is read-only and ignored on parse. `Payload::diff` sends only changed fields (or non-empty ones when creating). `updated_on` from the file is used for conflict detection.
+- `src/fs.rs`: the `FileSystemContext` impl (`RedmineFs`).
+
+### fs.rs model
+
+- **Paths resolve to `Node`s** (`resolve`): `\<tracker>\<id subject>\{issue.md, comment_<journal id>.md, attachments\<name>}`. Matching is case-insensitive; issue folders resolve by leading ID (`leading_id`), so the subject part of the name is cosmetic.
+- **Server data is cached** in `State.issues` / `State.lists` with a 30s `TTL`; `invalidate` drops an issue and all lists after a write. Attachment bodies (`blobs`) are cached until unmount.
+- **`State.local` is an in-memory overlay** of `Entry`s keyed by lowercased path: `#<id>\<rest>` under existing issues, `\<tracker>\<folder>\...` for pending (not-yet-created) issue folders. It holds new/scratch files, error files, and edit buffers for `issue.md`/comments. Overlay entries shadow or add to server listings in `list_dir`.
+  - `open` snapshots `issue.md`/comments into a *transient* entry so a handle sees consistent text; transient + clean entries are dropped on last `close`.
+  - `dirty` = written but not successfully sent.
+- **Writes go to Redmine on `cleanup`** (last handle close) via `commit` -> `send`, returning a `Done` that decides what happens to the overlay (`Updated`, `Consumed` = local file becomes server data and disappears, `Created` = pending folder becomes a real issue and is recorded in `aliases`). On failure the buffer stays dirty and `<name>.error.txt` is written next to it.
+- **`rename` also commits**: editors' atomic save (temp file -> `issue.md`) and moving a file onto a meaningful name trigger an immediate send.
+- One global `Mutex<State>` is held across HTTP calls (marked `ponytail:`, intentional).
+
+## Conventions
+
+- Deliberate shortcuts are marked with `// ponytail:` comments naming the limit and upgrade path; keep that style.
+- Errors to the kernel: map with `err(STATUS_*)` / `nf()` / `io()`; user-visible send errors go into `.error.txt`, not just stderr.
