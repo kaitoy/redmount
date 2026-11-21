@@ -1,18 +1,28 @@
 # redmount
 
-Mounts a single Redmine project as a Windows drive so you can read and write issues as files. Built on WinFsp.
+Mounts a single Redmine project as a drive (Windows) or a directory (Linux/macOS) so you can read and write issues as files. Built on WinFsp on Windows and FUSE elsewhere.
 
 ## Requirements
-- [WinFsp](https://winfsp.dev/) 2.1 or later
-- Rust (MSVC toolchain) and Visual Studio Build Tools ("Desktop development with C++")
+- Windows: [WinFsp](https://winfsp.dev/) 2.1 or later; to build, Rust (MSVC toolchain) and Visual Studio Build Tools ("Desktop development with C++")
+- Linux: FUSE (`fusermount3` or `fusermount`, e.g. the `fuse3` package); to build, just Rust
+- macOS: [macFUSE](https://macfuse.github.io/); to build, Rust and `pkgconf`
 - Redmine: enable the REST API and look up your API key on the "My account" page
+
+Prebuilt binaries for all three are produced by the GitHub Actions `build` workflow (artifacts).
 
 ## Usage
 ```powershell
 $env:REDMINE_API_KEY = "xxxxxxxx"
 cargo run --release -- --url https://redmine.example.com --project myproj --mount R:
 ```
-Press Enter to unmount.
+```sh
+export REDMINE_API_KEY=xxxxxxxx
+mkdir -p ~/redmine
+cargo run --release -- --url https://redmine.example.com --project myproj --mount ~/redmine
+```
+Press Enter to unmount. If the process died, unmount with `fusermount -u ~/redmine` (Linux) or `umount ~/redmine` (macOS).
+
+The examples below use Windows paths; on Linux/macOS they are `~/redmine/Bug/123 Login fails/issue.md` and so on.
 
 ## Layout
 ```

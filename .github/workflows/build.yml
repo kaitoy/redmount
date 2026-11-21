@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bin: redmount.exe
+          - os: ubuntu-latest
+            bin: redmount
+          - os: macos-latest
+            bin: redmount
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Windows'
+        run: choco install winfsp -y
+      # Linux needs no FUSE headers (fuser mounts via fusermount); macOS links macFUSE's libfuse.
+      - if: runner.os == 'macOS'
+        run: brew install --cask macfuse && brew install pkgconf
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redmount-${{ runner.os }}
+          path: target/release/${{ matrix.bin }}

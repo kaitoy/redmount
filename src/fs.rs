@@ -1,40 +1,47 @@
-//! WinFsp filesystem: `\<tracker>\<id subject>\{issue.md, comment_<journal>.md, attachments\*}`.
+//! OS-neutral filesystem core: `\<tracker>\<id subject>\{issue.md, comment_<journal>.md, attachments\*}`.
+//! Paths always use `\`; `win.rs` (WinFsp) and `fuse.rs` (FUSE) adapt it to the OS.
 use crate::markdown;
 use crate::redmine::{Api, Attachment, Issue, Journal, Meta};
 use anyhow::{Context, anyhow, bail};
 use reqwest::Method;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{
-    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_END_OF_FILE, STATUS_IO_DEVICE_ERROR,
-    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-};
-use winfsp::constants::FspCleanupFlags;
-use winfsp::filesystem::{
-    DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo, WideNameInfo,
-};
-use winfsp::{FspError, U16CStr};
-
-type Res<T> = winfsp::Result<T>;
 
 const TTL: Duration = Duration::from_secs(30);
-const DIR: u32 = 0x10; // FILE_ATTRIBUTE_DIRECTORY
-const FILE: u32 = 0x20; // FILE_ATTRIBUTE_ARCHIVE
-const FILE_DIRECTORY_FILE: u32 = 0x1;
-const EPOCH: u64 = 116_444_736_000_000_000; // 1601-01-01 -> 1970-01-01 in 100ns
+/// 1601-01-01 -> 1970-01-01 in 100ns (times are FILETIME units)
+pub const EPOCH: u64 = 116_444_736_000_000_000;
 
-fn err(s: NTSTATUS) -> FspError {
-    FspError::NTSTATUS(s.0)
+/// Errors the adapters map to NTSTATUS / errno.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum E {
+    NotFound,
+    PathNotFound,
+    Denied,
+    Exists,
+    NotDir,
+    NotEmpty,
+    Io,
 }
-fn nf() -> FspError {
-    err(STATUS_OBJECT_NAME_NOT_FOUND)
+
+pub type Res<T> = Result<T, E>;
+
+fn nf() -> E {
+    E::NotFound
 }
-fn io(e: anyhow::Error) -> FspError {
+fn io(e: anyhow::Error) -> E {
     eprintln!("error: {e:#}");
-    err(STATUS_IO_DEVICE_ERROR)
+    E::Io
+}
+
+/// File attributes; times in FILETIME units.
+#[derive(Clone, Copy, Debug)]
+pub struct Stat {
+    pub dir: bool,
+    pub size: u64,
+    pub created: u64,
+    pub modified: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,6 +60,7 @@ enum Node {
 }
 
 impl Node {
+    #[cfg(windows)]
     fn is_dir(self) -> bool {
         matches!(self, Node::Root | Node::Tracker(_) | Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_))
     }
@@ -89,19 +97,6 @@ struct State {
     aliases: HashMap<String, u64>,
 }
 
-pub struct Handle {
-    path: Mutex<String>,
-}
-
-impl Handle {
-    fn path(&self) -> String {
-        self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-    fn set_path(&self, p: String) {
-        *self.path.lock().unwrap_or_else(|e| e.into_inner()) = p;
-    }
-}
-
 enum Done {
     Updated(u64),
     /// The local file became server data (new note / upload) and goes away.
@@ -113,15 +108,14 @@ enum Done {
 pub struct RedmineFs {
     api: Api,
     meta: Meta,
-    sd: Vec<u8>,
     started: u64,
     // ponytail: one global lock, held across HTTP calls; per-path locks if it gets sluggish
     st: Mutex<State>,
 }
 
 impl RedmineFs {
-    pub fn new(api: Api, meta: Meta) -> anyhow::Result<Self> {
-        Ok(Self { api, meta, sd: security_descriptor()?, started: now(), st: Mutex::default() })
+    pub fn new(api: Api, meta: Meta) -> Self {
+        Self { api, meta, started: now(), st: Mutex::default() }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -212,8 +206,8 @@ impl RedmineFs {
         })
     }
 
-    fn node_of(&self, st: &mut State, h: &Handle) -> Res<(Node, String)> {
-        self.resolve(st, &h.path())?.ok_or_else(nf)
+    fn must_resolve(&self, st: &mut State, path: &str) -> Res<(Node, String)> {
+        self.resolve(st, path)?.ok_or_else(nf)
     }
 
     fn render(&self, st: &mut State, node: Node) -> Res<Vec<u8>> {
@@ -227,7 +221,7 @@ impl RedmineFs {
         })
     }
 
-    fn info(&self, st: &mut State, node: Node, key: &str) -> Res<FileInfo> {
+    fn info(&self, st: &mut State, node: Node, key: &str) -> Res<Stat> {
         if let Some(e) = st.local.get(key) {
             return Ok(finfo(e.dir, e.data.len() as u64, e.time, e.time));
         }
@@ -258,11 +252,11 @@ impl RedmineFs {
         })
     }
 
-    fn list_dir(&self, st: &mut State, node: Node, key: &str) -> Res<Vec<(String, FileInfo)>> {
-        let mut out: Vec<(String, FileInfo)> = match node {
+    fn list_dir(&self, st: &mut State, node: Node, key: &str) -> Res<Vec<(String, Stat)>> {
+        let mut out: Vec<(String, Stat)> = match node {
             Node::Root => {
                 let fi = finfo(true, 0, self.started, self.started);
-                self.meta.trackers.iter().map(|t| (sanitize(&t.name, 100), fi.clone())).collect()
+                self.meta.trackers.iter().map(|t| (sanitize(&t.name, 100), fi)).collect()
             }
             Node::Tracker(tid) => self
                 .list(st, tid)?
@@ -292,7 +286,7 @@ impl RedmineFs {
                     .collect()
             }
             Node::Pending(_) => Vec::new(),
-            _ => return Err(err(STATUS_NOT_A_DIRECTORY)),
+            _ => return Err(E::NotDir),
         };
         for (name, fi) in local_children(st, key) {
             if !out.iter().any(|(n, _)| n.to_lowercase() == name.to_lowercase()) {
@@ -311,9 +305,9 @@ impl RedmineFs {
                 st.local.insert(key.to_string(), Entry::new(split_parent(path).1, false, data, true));
             }
             Node::IssueMd(_) | Node::Comment(..) | Node::Local => {}
-            _ => return Err(err(STATUS_ACCESS_DENIED)),
+            _ => return Err(E::Denied),
         }
-        st.local.get_mut(key).filter(|e| !e.dir).ok_or_else(|| err(STATUS_ACCESS_DENIED))
+        st.local.get_mut(key).filter(|e| !e.dir).ok_or(E::Denied)
     }
 
     /// Sends a dirty buffer to Redmine. On failure the buffer stays dirty and `<name>.error.txt` explains why.
@@ -434,62 +428,39 @@ impl RedmineFs {
             st.local.remove(&format!("{key}.error.txt"));
         }
     }
-
-    fn copy_sd(&self, buf: Option<&mut [c_void]>) {
-        if let Some(buf) = buf
-            && buf.len() >= self.sd.len()
-        {
-            // SAFETY: buf holds at least sd.len() bytes.
-            unsafe { std::ptr::copy_nonoverlapping(self.sd.as_ptr(), buf.as_mut_ptr().cast::<u8>(), self.sd.len()) };
-        }
-    }
 }
 
-impl FileSystemContext for RedmineFs {
-    type FileContext = Handle;
-
-    fn get_security_by_name(
-        &self,
-        file_name: &U16CStr,
-        security_descriptor: Option<&mut [c_void]>,
-        _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
-    ) -> Res<FileSecurity> {
-        let path = file_name.to_string_lossy();
+/// Operations the OS adapters call. Each one takes the global lock once.
+impl RedmineFs {
+    #[cfg(windows)]
+    pub fn is_dir(&self, path: &str) -> Res<bool> {
         let mut st = self.lock();
-        let (node, key) = self.resolve(&mut st, &path)?.ok_or_else(nf)?;
-        let dir = node.is_dir() || st.local.get(&key).is_some_and(|e| e.dir);
-        self.copy_sd(security_descriptor);
-        Ok(FileSecurity {
-            reparse: false,
-            sz_security_descriptor: self.sd.len() as u64,
-            attributes: if dir { DIR } else { FILE },
-        })
+        let (node, key) = self.must_resolve(&mut st, path)?;
+        Ok(node.is_dir() || st.local.get(&key).is_some_and(|e| e.dir))
     }
 
-    fn open(
-        &self,
-        file_name: &U16CStr,
-        _create_options: u32,
-        _granted_access: u32,
-        file_info: &mut OpenFileInfo,
-    ) -> Res<Handle> {
-        let path = file_name.to_string_lossy();
+    pub fn stat(&self, path: &str) -> Res<Stat> {
         let mut st = self.lock();
-        let (node, key) = self.resolve(&mut st, &path)?.ok_or_else(nf)?;
+        let (node, key) = self.must_resolve(&mut st, path)?;
+        self.info(&mut st, node, &key)
+    }
+
+    /// Counts a handle; issue.md / comments get a snapshot so the handle sees one consistent text.
+    pub fn open(&self, path: &str) -> Res<Stat> {
+        let mut st = self.lock();
+        let (node, key) = self.must_resolve(&mut st, path)?;
         if matches!(node, Node::IssueMd(_) | Node::Comment(..)) {
-            // snapshot so readers/writers of this handle see one consistent text
-            self.entry(&mut st, node, &key, &path)?;
+            self.entry(&mut st, node, &key, path)?;
         }
         if let Some(e) = st.local.get_mut(&key) {
             e.opens += 1;
         }
-        *file_info.as_mut() = self.info(&mut st, node, &key)?;
-        Ok(Handle { path: Mutex::new(path) })
+        self.info(&mut st, node, &key)
     }
 
-    fn close(&self, h: Handle) {
+    pub fn close(&self, path: &str) {
         let mut st = self.lock();
-        let Ok(Some((_, key))) = self.resolve(&mut st, &h.path()) else { return };
+        let Ok(Some((_, key))) = self.resolve(&mut st, path) else { return };
         let idle = st.local.get_mut(&key).is_some_and(|e| {
             e.opens = e.opens.saturating_sub(1);
             e.opens == 0 && e.transient && !e.dirty
@@ -499,30 +470,18 @@ impl FileSystemContext for RedmineFs {
         }
     }
 
-    fn create(
-        &self,
-        file_name: &U16CStr,
-        create_options: u32,
-        _granted_access: u32,
-        _file_attributes: u32,
-        _security_descriptor: Option<&[c_void]>,
-        _allocation_size: u64,
-        _extra_buffer: Option<&[u8]>,
-        _extra_buffer_is_reparse_point: bool,
-        file_info: &mut OpenFileInfo,
-    ) -> Res<Handle> {
-        let path = file_name.to_string_lossy();
-        let (parent, name) = split_parent(&path);
+    /// New in-memory file or folder, counted as open once (`close` it).
+    pub fn create(&self, path: &str, dir: bool) -> Res<Stat> {
+        let (parent, name) = split_parent(path);
         let mut st = self.lock();
-        let (pnode, pkey) = self.resolve(&mut st, parent)?.ok_or_else(|| err(STATUS_OBJECT_PATH_NOT_FOUND))?;
-        let dir = create_options & FILE_DIRECTORY_FILE != 0;
+        let (pnode, pkey) = self.resolve(&mut st, parent)?.ok_or(E::PathNotFound)?;
         match (pnode, dir) {
             (Node::Tracker(_), true) | (Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_), false) => {}
-            _ => return Err(err(STATUS_ACCESS_DENIED)),
+            _ => return Err(E::Denied),
         }
         let key = format!("{pkey}\\{}", name.to_lowercase());
         if st.local.contains_key(&key) {
-            return Err(err(STATUS_OBJECT_NAME_COLLISION));
+            return Err(E::Exists);
         }
         let mut e = Entry::new(name, dir, Vec::new(), false);
         e.opens = 1;
@@ -531,104 +490,59 @@ impl FileSystemContext for RedmineFs {
             let tpl = markdown::template(&self.meta).into_bytes();
             st.local.insert(format!("{key}\\issue.md"), Entry::new("issue.md", false, tpl, false));
         }
-        *file_info.as_mut() = self.info(&mut st, Node::Local, &key)?;
-        Ok(Handle { path: Mutex::new(path) })
+        self.info(&mut st, Node::Local, &key)
     }
 
-    fn cleanup(&self, h: &Handle, _file_name: Option<&U16CStr>, flags: u32) {
-        let path = h.path();
+    /// A handle is done: delete the file (`check_delete` passed) or send its unsent edits.
+    pub fn cleanup(&self, path: &str, delete: bool) {
         let mut st = self.lock();
-        let Ok(Some((node, key))) = self.resolve(&mut st, &path) else { return };
-        if FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
+        let Ok(Some((node, key))) = self.resolve(&mut st, path) else { return };
+        if delete {
             self.remove(&mut st, node, &key);
         } else if st.local.get(&key).is_some_and(|e| e.dirty) {
-            self.commit(&mut st, node, &path, &key);
+            self.commit(&mut st, node, path, &key);
         }
     }
 
-    fn flush(&self, h: Option<&Handle>, file_info: &mut FileInfo) -> Res<()> {
-        match h {
-            Some(h) => self.get_file_info(h, file_info),
-            None => Ok(()),
+    pub fn check_delete(&self, path: &str) -> Res<()> {
+        let mut st = self.lock();
+        let (node, key) = self.must_resolve(&mut st, path)?;
+        match node {
+            Node::Local | Node::Attachment(..) => Ok(()),
+            Node::Pending(_) if local_children(&st, &key).is_empty() => Ok(()),
+            Node::Pending(_) => Err(E::NotEmpty),
+            // only unsent edits can be "deleted" (= discarded)
+            Node::IssueMd(_) | Node::Comment(..) if st.local.get(&key).is_some_and(|e| e.dirty) => Ok(()),
+            _ => Err(E::Denied),
         }
     }
 
-    fn get_file_info(&self, h: &Handle, file_info: &mut FileInfo) -> Res<()> {
+    /// `alloc_only`: just an allocation hint; it may shrink but never grow the file.
+    pub fn set_size(&self, path: &str, size: u64, alloc_only: bool) -> Res<Stat> {
         let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
-        *file_info = self.info(&mut st, node, &key)?;
-        Ok(())
-    }
-
-    fn get_security(&self, _h: &Handle, security_descriptor: Option<&mut [c_void]>) -> Res<u64> {
-        self.copy_sd(security_descriptor);
-        Ok(self.sd.len() as u64)
-    }
-
-    fn overwrite(
-        &self,
-        h: &Handle,
-        _file_attributes: u32,
-        _replace_file_attributes: bool,
-        _allocation_size: u64,
-        _extra_buffer: Option<&[u8]>,
-        file_info: &mut FileInfo,
-    ) -> Res<()> {
-        let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
-        let e = self.entry(&mut st, node, &key, &h.path())?;
-        e.data.clear();
-        e.dirty = true;
-        *file_info = self.info(&mut st, node, &key)?;
-        Ok(())
-    }
-
-    fn read_directory(
-        &self,
-        h: &Handle,
-        _pattern: Option<&U16CStr>,
-        marker: DirMarker,
-        buffer: &mut [u8],
-    ) -> Res<u32> {
-        let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
-        let mut entries = self.list_dir(&mut st, node, &key)?;
-        drop(st);
-        if node != Node::Root {
-            let me = finfo(true, 0, self.started, self.started);
-            entries.insert(0, ("..".to_string(), me.clone()));
-            entries.insert(0, (".".to_string(), me));
+        let (node, key) = self.must_resolve(&mut st, path)?;
+        let e = self.entry(&mut st, node, &key, path)?;
+        let n = size as usize;
+        if (!alloc_only || n < e.data.len()) && n != e.data.len() {
+            e.data.resize(n, 0);
+            e.dirty = true;
         }
-        let start = match marker.inner_as_cstr() {
-            None => 0,
-            Some(m) => {
-                let m = m.to_string_lossy();
-                match entries.iter().position(|(n, _)| *n == m) {
-                    Some(i) => i + 1,
-                    None => entries.iter().position(|(n, _)| n.to_lowercase() > m.to_lowercase()).unwrap_or(entries.len()),
-                }
-            }
-        };
-        let mut cursor = 0u32;
-        for (name, fi) in &entries[start..] {
-            let mut di = DirInfo::<255>::new();
-            *di.file_info_mut() = fi.clone();
-            di.set_name(name)?;
-            if !di.append_to_buffer(buffer, &mut cursor) {
-                return Ok(cursor);
-            }
-        }
-        DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-        Ok(cursor)
+        self.info(&mut st, node, &key)
     }
 
-    fn rename(&self, h: &Handle, file_name: &U16CStr, new_file_name: &U16CStr, replace_if_exists: bool) -> Res<()> {
-        let (from, to) = (file_name.to_string_lossy(), new_file_name.to_string_lossy());
-        let (to_parent, to_name) = split_parent(&to);
+    /// Sorted entries, without `.` / `..`.
+    pub fn read_dir(&self, path: &str) -> Res<Vec<(String, Stat)>> {
         let mut st = self.lock();
-        let (node, key) = self.resolve(&mut st, &from)?.ok_or_else(nf)?;
-        let (pnode, pkey) = self.resolve(&mut st, to_parent)?.ok_or_else(|| err(STATUS_OBJECT_PATH_NOT_FOUND))?;
-        let target = self.resolve(&mut st, &to)?;
+        let (node, key) = self.must_resolve(&mut st, path)?;
+        self.list_dir(&mut st, node, &key)
+    }
+
+    pub fn rename(&self, from: &str, to: &str, replace_if_exists: bool) -> Res<()> {
+        let (to_parent, to_name) = split_parent(to);
+        let mut st = self.lock();
+        let (node, key) = self.must_resolve(&mut st, from)?;
+        let (pnode, pkey) = self.resolve(&mut st, to_parent)?.ok_or(E::PathNotFound)?;
+        let target = self.resolve(&mut st, to)?;
         let new_key = match (node, pnode, &target) {
             // case-only rename
             (Node::Local | Node::Pending(_), _, Some((_, k))) if *k == key => key.clone(),
@@ -638,8 +552,8 @@ impl FileSystemContext for RedmineFs {
             }
             // atomic save: temp file -> issue.md / comment
             (Node::Local, _, Some((Node::Local | Node::IssueMd(_) | Node::Comment(..), k))) if replace_if_exists => k.clone(),
-            (_, _, Some(_)) => return Err(err(STATUS_OBJECT_NAME_COLLISION)),
-            _ => return Err(err(STATUS_ACCESS_DENIED)),
+            (_, _, Some(_)) => return Err(E::Exists),
+            _ => return Err(E::Denied),
         };
         let replaced_opens = if new_key == key { 0 } else { st.local.remove(&new_key).map_or(0, |e| e.opens) };
         let prefix = format!("{key}\\");
@@ -653,7 +567,6 @@ impl FileSystemContext for RedmineFs {
             }
             st.local.insert(format!("{new_key}{}", &k[key.len()..]), e);
         }
-        h.set_path(to.clone());
         // A file landing on a meaningful name (issue.md, *.md, attachments\) is sent right away.
         if node == Node::Local
             && let Some(e) = st.local.get_mut(&new_key)
@@ -661,56 +574,15 @@ impl FileSystemContext for RedmineFs {
         {
             e.dirty = true;
             let tnode = target.map_or(Node::Local, |(n, _)| n);
-            self.commit(&mut st, tnode, &to, &new_key);
+            self.commit(&mut st, tnode, to, &new_key);
         }
         Ok(())
     }
 
-    fn set_basic_info(
-        &self,
-        h: &Handle,
-        _file_attributes: u32,
-        _creation_time: u64,
-        _last_access_time: u64,
-        _last_write_time: u64,
-        _last_change_time: u64,
-        file_info: &mut FileInfo,
-    ) -> Res<()> {
-        self.get_file_info(h, file_info)
-    }
-
-    fn set_delete(&self, h: &Handle, _file_name: &U16CStr, delete_file: bool) -> Res<()> {
-        if !delete_file {
-            return Ok(());
-        }
+    /// Bytes copied; 0 at or past the end.
+    pub fn read(&self, path: &str, buffer: &mut [u8], offset: u64) -> Res<usize> {
         let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
-        match node {
-            Node::Local | Node::Attachment(..) => Ok(()),
-            Node::Pending(_) if local_children(&st, &key).is_empty() => Ok(()),
-            Node::Pending(_) => Err(err(STATUS_DIRECTORY_NOT_EMPTY)),
-            // only unsent edits can be "deleted" (= discarded)
-            Node::IssueMd(_) | Node::Comment(..) if st.local.get(&key).is_some_and(|e| e.dirty) => Ok(()),
-            _ => Err(err(STATUS_ACCESS_DENIED)),
-        }
-    }
-
-    fn set_file_size(&self, h: &Handle, new_size: u64, set_allocation_size: bool, file_info: &mut FileInfo) -> Res<()> {
-        let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
-        let e = self.entry(&mut st, node, &key, &h.path())?;
-        let n = new_size as usize;
-        if (!set_allocation_size || n < e.data.len()) && n != e.data.len() {
-            e.data.resize(n, 0);
-            e.dirty = true;
-        }
-        *file_info = self.info(&mut st, node, &key)?;
-        Ok(())
-    }
-
-    fn read(&self, h: &Handle, buffer: &mut [u8], offset: u64) -> Res<u32> {
-        let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
+        let (node, key) = self.must_resolve(&mut st, path)?;
         let rendered = match node {
             _ if st.local.contains_key(&key) => None,
             Node::Attachment(id, att) => {
@@ -726,29 +598,19 @@ impl FileSystemContext for RedmineFs {
             (None, None, Node::Attachment(_, att)) => st.blobs[&att].as_slice(),
             _ => &[],
         };
-        let off = offset as usize;
-        if off >= data.len() {
-            return Err(err(STATUS_END_OF_FILE));
-        }
+        let off = (offset as usize).min(data.len());
         let n = buffer.len().min(data.len() - off);
         buffer[..n].copy_from_slice(&data[off..off + n]);
-        Ok(n as u32)
+        Ok(n)
     }
 
-    fn write(
-        &self,
-        h: &Handle,
-        buffer: &[u8],
-        offset: u64,
-        write_to_eof: bool,
-        constrained_io: bool,
-        file_info: &mut FileInfo,
-    ) -> Res<u32> {
+    /// `constrained`: never grow the file (Windows paging I/O).
+    pub fn write(&self, path: &str, buffer: &[u8], offset: u64, to_eof: bool, constrained: bool) -> Res<(usize, Stat)> {
         let mut st = self.lock();
-        let (node, key) = self.node_of(&mut st, h)?;
-        let e = self.entry(&mut st, node, &key, &h.path())?;
-        let off = if write_to_eof { e.data.len() } else { offset as usize };
-        let len = if constrained_io { buffer.len().min(e.data.len().saturating_sub(off)) } else { buffer.len() };
+        let (node, key) = self.must_resolve(&mut st, path)?;
+        let e = self.entry(&mut st, node, &key, path)?;
+        let off = if to_eof { e.data.len() } else { offset as usize };
+        let len = if constrained { buffer.len().min(e.data.len().saturating_sub(off)) } else { buffer.len() };
         if len > 0 {
             if off + len > e.data.len() {
                 e.data.resize(off + len, 0);
@@ -756,19 +618,11 @@ impl FileSystemContext for RedmineFs {
             e.data[off..off + len].copy_from_slice(&buffer[..len]);
             e.dirty = true;
         }
-        *file_info = self.info(&mut st, node, &key)?;
-        Ok(len as u32)
-    }
-
-    fn get_volume_info(&self, out: &mut VolumeInfo) -> Res<()> {
-        out.total_size = 1 << 40;
-        out.free_size = 1 << 39;
-        out.set_volume_label("Redmine");
-        Ok(())
+        Ok((len, self.info(&mut st, node, &key)?))
     }
 }
 
-fn local_children(st: &State, key: &str) -> Vec<(String, FileInfo)> {
+fn local_children(st: &State, key: &str) -> Vec<(String, Stat)> {
     let prefix = format!("{key}\\");
     st.local
         .range(prefix.clone()..)
@@ -827,17 +681,8 @@ fn att_names(i: &Issue) -> Vec<(String, &Attachment)> {
         .collect()
 }
 
-fn finfo(dir: bool, size: u64, created: u64, modified: u64) -> FileInfo {
-    FileInfo {
-        file_attributes: if dir { DIR } else { FILE },
-        file_size: size,
-        allocation_size: size.div_ceil(4096) * 4096,
-        creation_time: created,
-        last_access_time: modified,
-        last_write_time: modified,
-        change_time: modified,
-        ..Default::default()
-    }
+fn finfo(dir: bool, size: u64, created: u64, modified: u64) -> Stat {
+    Stat { dir, size, created, modified }
 }
 
 fn now() -> u64 {
@@ -859,25 +704,6 @@ fn ft(s: &str) -> u64 {
     let doy = (153 * ((mo + 9) % 12) + 2) / 5 + d - 1;
     let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
     (days * 86_400 + h * 3600 + mi * 60 + se) as u64 * 10_000_000 + EPOCH
-}
-
-fn security_descriptor() -> anyhow::Result<Vec<u8>> {
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: plain Win32 calls; the descriptor is read right after creation.
-    // ponytail: the LocalAlloc'd descriptor is leaked once at startup
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            windows::core::w!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"),
-            SDDL_REVISION_1,
-            &mut sd,
-            None,
-        )?;
-        Ok(std::slice::from_raw_parts(sd.0 as *const u8, GetSecurityDescriptorLength(sd) as usize).to_vec())
-    }
 }
 
 #[cfg(test)]
