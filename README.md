@@ -51,3 +51,7 @@ A file is sent to Redmine when it is saved and closed.
 - Deleting an unsent `issue.md` or comment discards those edits.
 - Non-`.md` files (editor temp files, etc.) are kept in memory only and never sent to Redmine. They disappear on unmount.
 - Issues and comments cannot be deleted.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE). The Windows build statically links [winfsp-rs](https://github.com/SnowflakePowered/winfsp-rs) (GPL-3.0).
