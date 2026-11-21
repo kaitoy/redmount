@@ -29,8 +29,8 @@ Adapters only translate types; behavior changes belong in `fs.rs`.
 
 ### fs.rs model
 
-- **Paths resolve to `Node`s** (`resolve`): `\<tracker>\<id subject>\{issue.md, comment_<journal id>.md, attachments\<name>}`. Matching is case-insensitive; issue folders resolve by leading ID (`leading_id`), so the subject part of the name is cosmetic.
-- **Server data is cached** in `State.issues` / `State.lists` with a 30s `TTL`; `invalidate` drops an issue and all lists after a write. Attachment bodies (`blobs`) are cached until unmount.
+- **Paths resolve to `Node`s** (`resolve`): `\<tracker>\<id subject>\{issue.md, comment_<journal id>.md, attachments\<name>}`. Matching is case-insensitive; issue folders resolve by leading ID (`leading_id`), so the subject part of the name is cosmetic. Tracker folders list open issues; `\<tracker>\_closed\` (`Node::Closed`) lists closed ones, and `_closed\<issue>\...` resolves exactly like `<issue>\...`.
+- **Server data is cached** in `State.issues` (30s `TTL`) and `State.lists` keyed by (tracker, closed). A list is fetched in full once (and every `FULL`), then refreshed after `TTL` by a project-wide `updated_on>=cursor` delta (`List::merge`); `invalidate` drops an issue and marks lists for a delta after a write. Attachment bodies (`blobs`) are cached until unmount.
 - **`State.local` is an in-memory overlay** of `Entry`s keyed by lowercased path: `#<id>\<rest>` under existing issues, `\<tracker>\<folder>\...` for pending (not-yet-created) issue folders. It holds new/scratch files, error files, and edit buffers for `issue.md`/comments. Overlay entries shadow or add to server listings in `list_dir`.
   - `open` snapshots `issue.md`/comments into a *transient* entry so a handle sees consistent text; transient + clean entries are dropped on last `close`.
   - `dirty` = written but not successfully sent.

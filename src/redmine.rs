@@ -72,6 +72,7 @@ pub struct Meta {
     pub project_id: u64,
     pub trackers: Vec<IdName>,
     pub statuses: Vec<IdName>,
+    pub closed_statuses: Vec<u64>,
     pub priorities: Vec<IdName>,
     pub users: Vec<IdName>,
     pub categories: Vec<IdName>,
@@ -143,8 +144,15 @@ impl Api {
             project: Proj,
         }
         #[derive(Deserialize)]
+        struct St {
+            id: u64,
+            name: String,
+            #[serde(default)]
+            is_closed: bool,
+        }
+        #[derive(Deserialize)]
         struct S {
-            issue_statuses: Vec<IdName>,
+            issue_statuses: Vec<St>,
         }
         #[derive(Deserialize)]
         struct Pr {
@@ -175,26 +183,29 @@ impl Api {
             .into_iter()
             .filter_map(|m| m.user.or(m.group))
             .collect();
+        let st = self.get::<S>("/issue_statuses.json")?.issue_statuses;
         Ok(Meta {
             project_id: p.project.id,
             trackers: p.project.trackers,
             categories: p.project.issue_categories,
             custom_fields: p.project.issue_custom_fields,
-            statuses: self.get::<S>("/issue_statuses.json")?.issue_statuses,
+            closed_statuses: st.iter().filter(|s| s.is_closed).map(|s| s.id).collect(),
+            statuses: st.into_iter().map(|s| IdName { id: s.id, name: s.name }).collect(),
             priorities: self.get::<Pr>("/enumerations/issue_priorities.json")?.issue_priorities,
             versions: self.get::<V>(&format!("/projects/{project}/versions.json"))?.versions,
             users,
         })
     }
 
-    pub fn issues(&self, project_id: u64, tracker_id: u64) -> Result<Vec<Issue>> {
+    /// Issues of the project (subprojects excluded) matching `filter`, e.g. `tracker_id=1&status_id=open`.
+    pub fn issues(&self, project_id: u64, filter: &str) -> Result<Vec<Issue>> {
         #[derive(Deserialize)]
         struct L {
             issues: Vec<Issue>,
             total_count: usize,
         }
         self.paged(
-            &format!("/issues.json?project_id={project_id}&tracker_id={tracker_id}&status_id=*&subproject_id=!*"),
+            &format!("/issues.json?project_id={project_id}&subproject_id=!*&{filter}"),
             |l: L| (l.issues, l.total_count),
         )
     }

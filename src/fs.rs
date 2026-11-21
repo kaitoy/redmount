@@ -10,6 +10,11 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
+/// Listings are refreshed by `updated_on` deltas; a full refetch every FULL also drops deleted / moved-out issues.
+// ponytail: deletions and moves to another project show up only after FULL; shorten it if that bites
+const FULL: Duration = Duration::from_secs(600);
+/// Folder in each tracker folder listing its closed issues (the tracker folder itself lists open ones).
+const CLOSED: &str = "_closed";
 /// 1601-01-01 -> 1970-01-01 in 100ns (times are FILETIME units)
 pub const EPOCH: u64 = 116_444_736_000_000_000;
 
@@ -48,6 +53,8 @@ pub struct Stat {
 enum Node {
     Root,
     Tracker(u64),
+    /// `\<tracker>\_closed`
+    Closed(u64),
     IssueDir(u64),
     /// Folder made in a tracker folder; becomes an issue when its issue.md is saved.
     Pending(u64),
@@ -62,7 +69,7 @@ enum Node {
 impl Node {
     #[cfg(windows)]
     fn is_dir(self) -> bool {
-        matches!(self, Node::Root | Node::Tracker(_) | Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_))
+        matches!(self, Node::Root | Node::Tracker(_) | Node::Closed(_) | Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_))
     }
 }
 
@@ -85,11 +92,38 @@ impl Entry {
     }
 }
 
+/// Cached issues of one tracker folder (open) or its `_closed` folder.
+struct List {
+    /// Last full fetch or delta; `None` = check for changes on next use.
+    checked: Option<Instant>,
+    full: Instant,
+    /// Highest `updated_on` seen; the next delta asks for `updated_on >= cursor`.
+    cursor: String,
+    issues: BTreeMap<u64, Issue>,
+}
+
+impl List {
+    /// Applies a project-wide delta: changed issues go in or out depending on tracker / status.
+    fn merge(&mut self, changed: Vec<Issue>, tracker: u64, keep: impl Fn(&Issue) -> bool) {
+        for i in changed {
+            if i.updated_on > self.cursor {
+                self.cursor = i.updated_on.clone();
+            }
+            if i.tracker.id == tracker && keep(&i) {
+                self.issues.insert(i.id, i);
+            } else {
+                self.issues.remove(&i.id);
+            }
+        }
+    }
+}
+
 /// `local` keys: `#<id>\<lowercased rest>` under issues, `\<tracker>\<pending>\...` for pending folders.
 #[derive(Default)]
 struct State {
     issues: HashMap<u64, (Instant, Option<Issue>)>,
-    lists: HashMap<u64, (Instant, Vec<Issue>)>,
+    /// (tracker id, closed)
+    lists: HashMap<(u64, bool), List>,
     // ponytail: attachment bodies cached until unmount
     blobs: HashMap<u64, Vec<u8>>,
     local: BTreeMap<String, Entry>,
@@ -137,20 +171,35 @@ impl RedmineFs {
         self.issue(st, id)?.ok_or_else(nf)
     }
 
-    fn list(&self, st: &mut State, tracker: u64) -> Res<Vec<Issue>> {
-        if let Some((t, l)) = st.lists.get(&tracker)
-            && t.elapsed() < TTL
-        {
-            return Ok(l.clone());
+    fn list(&self, st: &mut State, tracker: u64, closed: bool) -> Res<Vec<Issue>> {
+        let key = (tracker, closed);
+        let pid = self.meta.project_id;
+        match st.lists.get_mut(&key) {
+            Some(l) if l.checked.is_some_and(|t| t.elapsed() < TTL) => {}
+            // the cursor is the newest updated_on in this list, so nothing edited after the fetch is missed
+            Some(l) if l.full.elapsed() < FULL && !l.cursor.is_empty() => {
+                let changed = self.api.issues(pid, &format!("status_id=*&updated_on=%3E%3D{}", l.cursor)).map_err(io)?;
+                l.merge(changed, tracker, |i| self.meta.closed_statuses.contains(&i.status.id) == closed);
+                l.checked = Some(Instant::now());
+            }
+            _ => {
+                let status = if closed { "closed" } else { "open" };
+                let v = self.api.issues(pid, &format!("tracker_id={tracker}&status_id={status}")).map_err(io)?;
+                let now = Instant::now();
+                let mut l = List { checked: Some(now), full: now, cursor: String::new(), issues: BTreeMap::new() };
+                l.merge(v, tracker, |_| true);
+                st.lists.insert(key, l);
+            }
         }
-        let l = self.api.issues(self.meta.project_id, tracker).map_err(io)?;
-        st.lists.insert(tracker, (Instant::now(), l.clone()));
-        Ok(l)
+        Ok(st.lists[&key].issues.values().cloned().collect())
     }
 
+    /// After a write: forget the issue and make listings fetch a delta next time.
     fn invalidate(&self, st: &mut State, id: u64) {
         st.issues.remove(&id);
-        st.lists.clear();
+        for l in st.lists.values_mut() {
+            l.checked = None;
+        }
     }
 
     fn blob(&self, st: &mut State, id: u64, att: u64) -> Res<()> {
@@ -165,7 +214,7 @@ impl RedmineFs {
 
     /// Path -> node + overlay key. `None` = doesn't exist.
     fn resolve(&self, st: &mut State, path: &str) -> Res<Option<(Node, String)>> {
-        let c: Vec<String> = path.split('\\').filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect();
+        let mut c: Vec<String> = path.split('\\').filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect();
         let Some(first) = c.first() else { return Ok(Some((Node::Root, String::new()))) };
         let Some(t) = self.meta.trackers.iter().find(|t| sanitize(&t.name, 100).to_lowercase() == *first) else {
             return Ok(None);
@@ -174,15 +223,24 @@ impl RedmineFs {
         if c.len() == 1 {
             return Ok(Some((Node::Tracker(t.id), tkey)));
         }
+        // `\<tracker>\_closed\<issue>\...` is the same issue as `\<tracker>\<issue>\...`; no pending folders there
+        let closed = c[1] == CLOSED;
+        if closed {
+            if c.len() == 2 {
+                return Ok(Some((Node::Closed(t.id), format!("{tkey}\\{CLOSED}"))));
+            }
+            c.remove(1);
+        }
         let local = |st: &State, key: String| st.local.contains_key(&key).then_some((Node::Local, key));
         let pkey = format!("{tkey}\\{}", c[1]);
-        if st.local.contains_key(&pkey) {
+        if !closed && st.local.contains_key(&pkey) {
             if c.len() == 2 {
                 return Ok(Some((Node::Pending(t.id), pkey)));
             }
             return Ok(local(st, format!("{pkey}\\{}", c[2..].join("\\"))));
         }
-        let Some(id) = st.aliases.get(&pkey).copied().or_else(|| leading_id(&c[1])) else { return Ok(None) };
+        let alias = if closed { None } else { st.aliases.get(&pkey).copied() };
+        let Some(id) = alias.or_else(|| leading_id(&c[1])) else { return Ok(None) };
         let Some(issue) = self.issue(st, id)? else { return Ok(None) };
         if c.len() == 2 {
             return Ok(Some((Node::IssueDir(id), format!("#{id}"))));
@@ -226,7 +284,7 @@ impl RedmineFs {
             return Ok(finfo(e.dir, e.data.len() as u64, e.time, e.time));
         }
         Ok(match node {
-            Node::Root | Node::Tracker(_) => finfo(true, 0, self.started, self.started),
+            Node::Root | Node::Tracker(_) | Node::Closed(_) => finfo(true, 0, self.started, self.started),
             Node::IssueDir(id) | Node::AttachDir(id) => {
                 let i = self.must_issue(st, id)?;
                 finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))
@@ -258,11 +316,18 @@ impl RedmineFs {
                 let fi = finfo(true, 0, self.started, self.started);
                 self.meta.trackers.iter().map(|t| (sanitize(&t.name, 100), fi)).collect()
             }
-            Node::Tracker(tid) => self
-                .list(st, tid)?
-                .iter()
-                .map(|i| (folder(i), finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))))
-                .collect(),
+            Node::Tracker(tid) | Node::Closed(tid) => {
+                let closed = matches!(node, Node::Closed(_));
+                let mut v: Vec<_> = self
+                    .list(st, tid, closed)?
+                    .iter()
+                    .map(|i| (folder(i), finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))))
+                    .collect();
+                if !closed {
+                    v.push((CLOSED.to_string(), finfo(true, 0, self.started, self.started)));
+                }
+                v
+            }
             Node::IssueDir(id) => {
                 let i = self.must_issue(st, id)?;
                 let mut v = vec![
@@ -480,7 +545,7 @@ impl RedmineFs {
             _ => return Err(E::Denied),
         }
         let key = format!("{pkey}\\{}", name.to_lowercase());
-        if st.local.contains_key(&key) {
+        if st.local.contains_key(&key) || (matches!(pnode, Node::Tracker(_)) && name.eq_ignore_ascii_case(CLOSED)) {
             return Err(E::Exists);
         }
         let mut e = Entry::new(name, dir, Vec::new(), false);
@@ -718,6 +783,34 @@ mod tests {
         assert_eq!(leading_id("New folder"), None);
         assert_eq!(comment_id("comment_45.md"), Some(45));
         assert_eq!(sanitize("a/b: c?. ", 60), "a_b_ c_");
+    }
+
+    #[test]
+    fn list_delta_merge() {
+        let issue = |id: u64, tracker: u64, status: u64, updated: &str| -> Issue {
+            serde_json::from_value(json!({
+                "id": id, "tracker": {"id": tracker}, "status": {"id": status}, "priority": {"id": 1},
+                "author": {"id": 1}, "subject": "s", "created_on": updated, "updated_on": updated
+            }))
+            .unwrap()
+        };
+        let open = |i: &Issue| i.status.id != 5;
+        let mut l = List { checked: None, full: Instant::now(), cursor: String::new(), issues: BTreeMap::new() };
+        l.merge(vec![issue(1, 1, 1, "2026-01-01T00:00:00Z"), issue(2, 1, 1, "2026-01-03T00:00:00Z")], 1, |_| true);
+        assert_eq!(l.cursor, "2026-01-03T00:00:00Z");
+        // 1 closed, 2 moved to another tracker, 3 new, 4 belongs elsewhere
+        l.merge(
+            vec![
+                issue(1, 1, 5, "2026-01-04T00:00:00Z"),
+                issue(2, 2, 1, "2026-01-05T00:00:00Z"),
+                issue(3, 1, 1, "2026-01-04T12:00:00Z"),
+                issue(4, 2, 1, "2026-01-04T00:00:00Z"),
+            ],
+            1,
+            open,
+        );
+        assert_eq!(l.issues.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(l.cursor, "2026-01-05T00:00:00Z");
     }
 
     #[test]

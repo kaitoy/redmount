@@ -29,8 +29,11 @@ The examples below use Windows paths; on Linux/macOS they are `~/redmine/Bug/123
 R:\Bug\123 Login fails\issue.md          Fields (front matter) + description
 R:\Bug\123 Login fails\comment_456.md    One file per comment
 R:\Bug\123 Login fails\attachments\      Attachments
+R:\Bug\_closed\98 Old crash\             Closed issues (the tracker folder lists open ones only)
 ```
-Folders are resolved by their leading ID, so `R:\Bug\123` works too.
+Folders are resolved by their leading ID, so `R:\Bug\123` works too, whether or not the issue is listed there.
+
+Listings are refreshed every 30 seconds by fetching only the issues updated since the last fetch. Deleted issues and issues moved to another project disappear from listings within 10 minutes.
 
 ## Writing
 A file is sent to Redmine when it is saved and closed.
