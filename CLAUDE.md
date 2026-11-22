@@ -23,7 +23,7 @@ A core plus one adapter per OS:
 - `src/markdown.rs`: `issue.md` / `comment_N.md` text <-> Redmine payloads. YAML front matter holds editable fields; everything after `RO_MARK` is read-only and ignored on parse. `Payload::diff` sends only changed fields (or non-empty ones when creating). `updated_on` from the file is used for conflict detection.
 - `src/fs.rs`: OS-neutral core (`RedmineFs`). Public ops take `\`-separated path strings (`open`, `close`, `create`, `cleanup`, `check_delete`, `rename`, `read`, `write`, `set_size`, `read_dir`, `stat`) and return `fs::E` / `fs::Stat` (times in FILETIME units).
 - `src/win.rs` (`cfg(windows)`): WinFsp `FileSystemContext` adapter (`WinFs`; `Handle` holds the path), volume params, security descriptor.
-- `src/fuse.rs` (`cfg(unix)`): `fuse_mt::FilesystemMT` adapter; converts `/` to `\` and `E` to errno. `release` = `cleanup` + `close`, `unlink`/`rmdir` = `check_delete` + `cleanup(delete)`, opens use direct I/O. macOS mounts with `noappledouble` so Finder's `._*.md` files aren't posted as comments.
+- `src/fuse.rs` (`cfg(unix)`): `fuse_mt::FilesystemMT` adapter; converts `/` to `\` and `E` to errno. `release` = `cleanup` + `close`, `unlink`/`rmdir` = `check_delete` + `cleanup(delete)`, opens use direct I/O. macOS mounts with `noappledouble` so Finder's `._*` files don't clutter issue folders.
 
 Adapters only translate types; behavior changes belong in `fs.rs`.
 

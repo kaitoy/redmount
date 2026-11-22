@@ -169,7 +169,7 @@ impl FilesystemMT for Fuse {
 pub fn run(fs: RedmineFs, mount: &str) -> anyhow::Result<()> {
     let mut opts = vec![OsStr::new("fsname=redmount")];
     if cfg!(target_os = "macos") {
-        // noappledouble: keeps Finder's `._issue.md` from being posted as a comment
+        // noappledouble: keeps Finder's `._*` files out of issue folders
         opts.extend([OsStr::new("noappledouble"), OsStr::new("volname=Redmine")]);
     }
     let session = fuse_mt::spawn_mount(FuseMT::new(Fuse(fs), 1), mount, &opts)?;

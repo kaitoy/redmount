@@ -459,7 +459,7 @@ impl RedmineFs {
                         let id = v["issue"]["id"].as_u64().context("No id in response")?;
                         Ok(Done::Created(id, pkey))
                     }
-                    Node::IssueDir(id) if lname.ends_with(".md") => {
+                    Node::IssueDir(id) if is_new_comment(name) => {
                         let notes = markdown::parse_comment(utf8(&data)?);
                         if notes.is_empty() {
                             return Ok(Done::Nothing);
@@ -624,7 +624,7 @@ impl RedmineFs {
             }
             st.local.insert(format!("{new_key}{}", &k[key.len()..]), e);
         }
-        // A file landing on a meaningful name (issue.md, *.md, attachments\) is sent right away.
+        // A file landing on a meaningful name (issue.md, comment.md, attachments\) is sent right away.
         if node == Node::Local
             && let Some(e) = st.local.get_mut(&new_key)
             && !e.data.is_empty()
@@ -727,6 +727,11 @@ fn comment_id(name: &str) -> Option<u64> {
     name.strip_prefix("comment_")?.strip_suffix(".md")?.parse().ok()
 }
 
+/// Only this name in an issue folder is posted as a new comment, so copied-in `.md` files aren't.
+fn is_new_comment(name: &str) -> bool {
+    name.eq_ignore_ascii_case("comment.md")
+}
+
 /// Attachment file names; duplicates get an `<id>_` prefix.
 fn att_names(i: &Issue) -> Vec<(String, &Attachment)> {
     i.attachments
@@ -774,6 +779,8 @@ mod tests {
         assert_eq!(leading_id("123 Login fails"), Some(123));
         assert_eq!(leading_id("New folder"), None);
         assert_eq!(comment_id("comment_45.md"), Some(45));
+        assert!(is_new_comment("comment.md") && is_new_comment("Comment.MD"));
+        assert!(!is_new_comment("memo.md") && !is_new_comment("comment_45.md") && !is_new_comment("._comment.md"));
         assert_eq!(sanitize("a/b: c?. ", 60), "a_b_ c_");
     }
 
