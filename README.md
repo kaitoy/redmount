@@ -53,6 +53,9 @@ A file is sent to Redmine when it is saved and closed. Editors that save by writ
 - Other files (editor temp files, `.md` files with other names, etc.) are kept in memory only and never sent to Redmine. They disappear on unmount.
 - Issues, comments and attachments cannot be deleted.
 
+## Agent Skill
+[`skills/redmount/`](skills/redmount/SKILL.md) is an [Agent Skill](https://agentskills.io/) that teaches AI agents the rules above. Copy the folder to `~/.claude/skills/` (or a project's `.claude/skills/`, or your agent's skills directory) and tell the agent where the drive is mounted.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE). The Windows build statically links [winfsp-rs](https://github.com/SnowflakePowered/winfsp-rs) (GPL-3.0).
