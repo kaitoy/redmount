@@ -44,13 +44,12 @@ A file is sent to Redmine when it is saved and closed.
 | Edit and save `comment_N.md` | Edits the comment (Redmine 5.0+) |
 | Create and save a new `*.md` in an issue folder | Adds a comment; the file is replaced by `comment_N.md` |
 | Copy a file into `attachments\` | Attaches it |
-| Delete a file in `attachments\` | Deletes the attachment |
 | Create a new folder in a tracker folder, fill in the `issue.md` template inside, and save | Creates an issue (the folder name is used if subject is empty) |
 
 - If sending fails (validation error, conflict, etc.), the reason is written to `<file name>.error.txt`. Your edits stay on the drive, so you can fix them and save again.
 - Deleting an unsent `issue.md` or comment discards those edits.
 - Non-`.md` files (editor temp files, etc.) are kept in memory only and never sent to Redmine. They disappear on unmount.
-- Issues and comments cannot be deleted.
+- Issues, comments and attachments cannot be deleted.
 
 ## License
 

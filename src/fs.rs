@@ -480,18 +480,10 @@ impl RedmineFs {
         }
     }
 
-    fn remove(&self, st: &mut State, node: Node, key: &str) {
-        if let Node::Attachment(id, att) = node {
-            if let Err(e) = self.api.send(Method::DELETE, &format!("/attachments/{att}.json"), None) {
-                eprintln!("attachment {att}: {e:#}");
-            }
-            st.blobs.remove(&att);
-            self.invalidate(st, id);
-        } else {
-            // local file / pending folder / discarding unsent edits of issue.md or a comment
-            remove_tree(st, key);
-            st.local.remove(&format!("{key}.error.txt"));
-        }
+    /// Local file / pending folder / discarding unsent edits of issue.md or a comment.
+    fn remove(st: &mut State, key: &str) {
+        remove_tree(st, key);
+        st.local.remove(&format!("{key}.error.txt"));
     }
 }
 
@@ -563,7 +555,7 @@ impl RedmineFs {
         let mut st = self.lock();
         let Ok(Some((node, key))) = self.resolve(&mut st, path) else { return };
         if delete {
-            self.remove(&mut st, node, &key);
+            Self::remove(&mut st, &key);
         } else if st.local.get(&key).is_some_and(|e| e.dirty) {
             self.commit(&mut st, node, path, &key);
         }
@@ -573,7 +565,7 @@ impl RedmineFs {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
         match node {
-            Node::Local | Node::Attachment(..) => Ok(()),
+            Node::Local => Ok(()),
             Node::Pending(_) if local_children(&st, &key).is_empty() => Ok(()),
             Node::Pending(_) => Err(E::NotEmpty),
             // only unsent edits can be "deleted" (= discarded)
