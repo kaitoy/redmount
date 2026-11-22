@@ -119,7 +119,8 @@ impl Api {
         let mut out = Vec::new();
         loop {
             let sep = if path.contains('?') { '&' } else { '?' };
-            let (mut page, total) = items(self.get(&format!("{path}{sep}limit=100&offset={}", out.len()))?);
+            let (mut page, total) =
+                items(self.get(&format!("{path}{sep}limit=100&offset={}", out.len()))?);
             let empty = page.is_empty();
             out.append(&mut page);
             if empty || out.len() >= total {
@@ -190,9 +191,19 @@ impl Api {
             categories: p.project.issue_categories,
             custom_fields: p.project.issue_custom_fields,
             closed_statuses: st.iter().filter(|s| s.is_closed).map(|s| s.id).collect(),
-            statuses: st.into_iter().map(|s| IdName { id: s.id, name: s.name }).collect(),
-            priorities: self.get::<Pr>("/enumerations/issue_priorities.json")?.issue_priorities,
-            versions: self.get::<V>(&format!("/projects/{project}/versions.json"))?.versions,
+            statuses: st
+                .into_iter()
+                .map(|s| IdName {
+                    id: s.id,
+                    name: s.name,
+                })
+                .collect(),
+            priorities: self
+                .get::<Pr>("/enumerations/issue_priorities.json")?
+                .issue_priorities,
+            versions: self
+                .get::<V>(&format!("/projects/{project}/versions.json"))?
+                .versions,
             users,
         })
     }
@@ -218,7 +229,10 @@ impl Api {
         }
         let r = self
             .http
-            .get(format!("{}/issues/{id}.json?include=journals,attachments", self.base))
+            .get(format!(
+                "{}/issues/{id}.json?include=journals,attachments",
+                self.base
+            ))
             .send()?;
         if matches!(r.status().as_u16(), 403 | 404) {
             return Ok(None);
@@ -232,7 +246,11 @@ impl Api {
             rb = rb.json(&b);
         }
         let text = Self::check(rb.send()?)?.text()?;
-        Ok(if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text)? })
+        Ok(if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)?
+        })
     }
 
     pub fn upload(&self, filename: &str, data: Vec<u8>) -> Result<String> {
@@ -244,7 +262,10 @@ impl Api {
             .body(data)
             .send()?;
         let v: Value = Self::check(r)?.json()?;
-        v["upload"]["token"].as_str().map(String::from).context("upload token missing")
+        v["upload"]["token"]
+            .as_str()
+            .map(String::from)
+            .context("upload token missing")
     }
 
     pub fn download(&self, url: &str) -> Result<Vec<u8>> {

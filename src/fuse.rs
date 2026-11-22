@@ -1,8 +1,9 @@
 //! FUSE adapter (Linux: fusermount, macOS: macFUSE): maps `fuse_mt` calls onto the `fs` core.
 use crate::fs::{E, EPOCH, RedmineFs, Stat};
 use fuse_mt::{
-    CallbackResult, CreatedEntry, DirectoryEntry, FileAttr, FileType, FilesystemMT, FuseMT, RequestInfo, ResultCreate,
-    ResultEmpty, ResultEntry, ResultOpen, ResultReaddir, ResultSlice, ResultStatfs, ResultWrite, Statfs,
+    CallbackResult, CreatedEntry, DirectoryEntry, FileAttr, FileType, FilesystemMT, FuseMT,
+    RequestInfo, ResultCreate, ResultEmpty, ResultEntry, ResultOpen, ResultReaddir, ResultSlice,
+    ResultStatfs, ResultWrite, Statfs,
 };
 use std::ffi::{OsStr, c_int};
 use std::path::Path;
@@ -46,7 +47,11 @@ fn attr(req: &RequestInfo, s: Stat) -> FileAttr {
         mtime: time(s.modified),
         ctime: time(s.modified),
         crtime: time(s.created),
-        kind: if s.dir { FileType::Directory } else { FileType::RegularFile },
+        kind: if s.dir {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        },
         perm: if s.dir { 0o755 } else { 0o644 },
         nlink: if s.dir { 2 } else { 1 },
         uid: req.uid,
@@ -67,7 +72,14 @@ impl FilesystemMT for Fuse {
         Ok(())
     }
 
-    fn chown(&self, _req: RequestInfo, _path: &Path, _fh: Option<u64>, _uid: Option<u32>, _gid: Option<u32>) -> ResultEmpty {
+    fn chown(
+        &self,
+        _req: RequestInfo,
+        _path: &Path,
+        _fh: Option<u64>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+    ) -> ResultEmpty {
         Ok(())
     }
 
@@ -76,7 +88,14 @@ impl FilesystemMT for Fuse {
         Ok(())
     }
 
-    fn utimens(&self, _req: RequestInfo, _path: &Path, _fh: Option<u64>, _a: Option<SystemTime>, _m: Option<SystemTime>) -> ResultEmpty {
+    fn utimens(
+        &self,
+        _req: RequestInfo,
+        _path: &Path,
+        _fh: Option<u64>,
+        _a: Option<SystemTime>,
+        _m: Option<SystemTime>,
+    ) -> ResultEmpty {
         Ok(())
     }
 
@@ -98,9 +117,17 @@ impl FilesystemMT for Fuse {
         self.unlink(req, parent, name)
     }
 
-    fn rename(&self, _req: RequestInfo, parent: &Path, name: &OsStr, newparent: &Path, newname: &OsStr) -> ResultEmpty {
+    fn rename(
+        &self,
+        _req: RequestInfo,
+        parent: &Path,
+        name: &OsStr,
+        newparent: &Path,
+        newname: &OsStr,
+    ) -> ResultEmpty {
         // POSIX rename always replaces the target
-        self.0.rename(&join(parent, name), &join(newparent, newname), true)?;
+        self.0
+            .rename(&join(parent, name), &join(newparent, newname), true)?;
         Ok(())
     }
 
@@ -109,7 +136,15 @@ impl FilesystemMT for Fuse {
         Ok((0, DIRECT_IO))
     }
 
-    fn read(&self, _req: RequestInfo, path: &Path, _fh: u64, offset: u64, size: u32, callback: impl FnOnce(ResultSlice<'_>) -> CallbackResult) -> CallbackResult {
+    fn read(
+        &self,
+        _req: RequestInfo,
+        path: &Path,
+        _fh: u64,
+        offset: u64,
+        size: u32,
+        callback: impl FnOnce(ResultSlice<'_>) -> CallbackResult,
+    ) -> CallbackResult {
         let mut buf = vec![0; size as usize];
         match self.0.read(&p(path), &mut buf, offset) {
             Ok(n) => callback(Ok(&buf[..n])),
@@ -117,7 +152,15 @@ impl FilesystemMT for Fuse {
         }
     }
 
-    fn write(&self, _req: RequestInfo, path: &Path, _fh: u64, offset: u64, data: Vec<u8>, _flags: u32) -> ResultWrite {
+    fn write(
+        &self,
+        _req: RequestInfo,
+        path: &Path,
+        _fh: u64,
+        offset: u64,
+        data: Vec<u8>,
+        _flags: u32,
+    ) -> ResultWrite {
         Ok(self.0.write(&p(path), &data, offset, false, false)?.0 as u32)
     }
 
@@ -125,7 +168,15 @@ impl FilesystemMT for Fuse {
         Ok(())
     }
 
-    fn release(&self, _req: RequestInfo, path: &Path, _fh: u64, _flags: u32, _lock_owner: u64, _flush: bool) -> ResultEmpty {
+    fn release(
+        &self,
+        _req: RequestInfo,
+        path: &Path,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+    ) -> ResultEmpty {
         let path = p(path);
         self.0.cleanup(&path, false);
         self.0.close(&path);
@@ -141,12 +192,19 @@ impl FilesystemMT for Fuse {
     }
 
     fn readdir(&self, _req: RequestInfo, path: &Path, _fh: u64) -> ResultReaddir {
-        let dot = |n: &str| DirectoryEntry { name: n.into(), kind: FileType::Directory };
+        let dot = |n: &str| DirectoryEntry {
+            name: n.into(),
+            kind: FileType::Directory,
+        };
         let mut out = vec![dot("."), dot("..")];
         for (name, s) in self.0.read_dir(&p(path))? {
             out.push(DirectoryEntry {
                 name: name.into(),
-                kind: if s.dir { FileType::Directory } else { FileType::RegularFile },
+                kind: if s.dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                },
             });
         }
         Ok(out)
@@ -157,12 +215,33 @@ impl FilesystemMT for Fuse {
     }
 
     fn statfs(&self, _req: RequestInfo, _path: &Path) -> ResultStatfs {
-        Ok(Statfs { blocks: 1 << 28, bfree: 1 << 27, bavail: 1 << 27, files: 0, ffree: 0, bsize: 4096, namelen: 255, frsize: 4096 })
+        Ok(Statfs {
+            blocks: 1 << 28,
+            bfree: 1 << 27,
+            bavail: 1 << 27,
+            files: 0,
+            ffree: 0,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+        })
     }
 
-    fn create(&self, req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, _flags: u32) -> ResultCreate {
+    fn create(
+        &self,
+        req: RequestInfo,
+        parent: &Path,
+        name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+    ) -> ResultCreate {
         let s = self.0.create(&join(parent, name), false)?;
-        Ok(CreatedEntry { ttl: TTL, attr: attr(&req, s), fh: 0, flags: DIRECT_IO })
+        Ok(CreatedEntry {
+            ttl: TTL,
+            attr: attr(&req, s),
+            fh: 0,
+            flags: DIRECT_IO,
+        })
     }
 }
 

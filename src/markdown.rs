@@ -32,7 +32,11 @@ impl Payload {
         let cfs: Vec<J> = self
             .cfs
             .iter()
-            .filter(|(id, v)| base.map_or(*v != &J::String(String::new()), |b| b.cfs.get(*id) != Some(*v)))
+            .filter(|(id, v)| {
+                base.map_or(*v != &J::String(String::new()), |b| {
+                    b.cfs.get(*id) != Some(*v)
+                })
+            })
             .map(|(id, v)| json!({ "id": id, "value": v }))
             .collect();
         if !cfs.is_empty() {
@@ -52,15 +56,29 @@ fn yaml(pairs: Vec<(&str, Y)>) -> String {
     serde_yaml::to_string(&m)
         .unwrap_or_default()
         .lines()
-        .map(|l| format!("{}\n", l.strip_suffix(": null").map_or(l.to_string(), |k| format!("{k}:"))))
+        .map(|l| {
+            format!(
+                "{}\n",
+                l.strip_suffix(": null")
+                    .map_or(l.to_string(), |k| format!("{k}:"))
+            )
+        })
         .collect()
 }
 
 fn editable(i: Option<&Issue>, meta: &Meta) -> Vec<(&'static str, Y)> {
     let name = |f: fn(&Issue) -> Option<&IdName>| y(i.and_then(f).map(|x| &x.name));
     let cf: Mapping = match i {
-        Some(i) => i.custom_fields.iter().map(|c| (y(&c.name), y(&c.value))).collect(),
-        None => meta.custom_fields.iter().map(|c| (y(&c.name), Y::Null)).collect(),
+        Some(i) => i
+            .custom_fields
+            .iter()
+            .map(|c| (y(&c.name), y(&c.value)))
+            .collect(),
+        None => meta
+            .custom_fields
+            .iter()
+            .map(|c| (y(&c.name), Y::Null))
+            .collect(),
     };
     vec![
         ("subject", y(i.map(|i| &i.subject))),
@@ -69,7 +87,10 @@ fn editable(i: Option<&Issue>, meta: &Meta) -> Vec<(&'static str, Y)> {
         ("assigned_to", name(|i| i.assigned_to.as_ref())),
         ("category", name(|i| i.category.as_ref())),
         ("fixed_version", name(|i| i.fixed_version.as_ref())),
-        ("parent_issue_id", y(i.and_then(|i| i.parent.as_ref()).map(|p| p.id))),
+        (
+            "parent_issue_id",
+            y(i.and_then(|i| i.parent.as_ref()).map(|p| p.id)),
+        ),
         ("start_date", y(i.and_then(|i| i.start_date.as_ref()))),
         ("due_date", y(i.and_then(|i| i.due_date.as_ref()))),
         ("done_ratio", y(i.and_then(|i| i.done_ratio))),
@@ -100,8 +121,15 @@ pub fn template(meta: &Meta) -> String {
 }
 
 pub fn render_comment(j: &Journal) -> String {
-    let ro = vec![("author", y(&j.user.name)), ("created_on", y(&j.created_on))];
-    format!("---\n{RO_MARK}{}---\n{}", yaml(ro), j.notes.as_deref().unwrap_or(""))
+    let ro = vec![
+        ("author", y(&j.user.name)),
+        ("created_on", y(&j.created_on)),
+    ];
+    format!(
+        "---\n{RO_MARK}{}---\n{}",
+        yaml(ro),
+        j.notes.as_deref().unwrap_or("")
+    )
 }
 
 pub fn parse_comment(text: &str) -> String {
@@ -135,7 +163,10 @@ fn scalar(v: &Y) -> String {
         Y::String(s) => s.trim().to_string(),
         Y::Bool(b) => b.to_string(),
         Y::Number(n) => n.to_string(),
-        other => serde_yaml::to_string(other).unwrap_or_default().trim().to_string(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
     }
 }
 
@@ -186,10 +217,20 @@ pub fn payload_of(i: &Issue) -> Payload {
         ("parent_issue_id", id(i.parent.as_ref())),
         ("start_date", i.start_date.clone().unwrap_or_default()),
         ("due_date", i.due_date.clone().unwrap_or_default()),
-        ("done_ratio", i.done_ratio.map_or(String::new(), |d| d.to_string())),
-        ("estimated_hours", i.estimated_hours.map_or(String::new(), |h| h.to_string())),
+        (
+            "done_ratio",
+            i.done_ratio.map_or(String::new(), |d| d.to_string()),
+        ),
+        (
+            "estimated_hours",
+            i.estimated_hours.map_or(String::new(), |h| h.to_string()),
+        ),
     ]);
-    let cfs = i.custom_fields.iter().map(|c| (c.id, cf_json(&c.value))).collect();
+    let cfs = i
+        .custom_fields
+        .iter()
+        .map(|c| (c.id, cf_json(&c.value)))
+        .collect();
     Payload { fields, cfs }
 }
 
@@ -204,21 +245,55 @@ pub fn parse_issue(text: &str, meta: &Meta, cur: Option<&Issue>) -> Result<Parse
     let fields = BTreeMap::from([
         ("subject", g("subject")),
         ("description", norm(body)),
-        ("status_id", lookup(&meta.statuses, &g("status"), cur.map(|i| &i.status), "status")?),
-        ("priority_id", lookup(&meta.priorities, &g("priority"), cur.map(|i| &i.priority), "priority")?),
+        (
+            "status_id",
+            lookup(
+                &meta.statuses,
+                &g("status"),
+                cur.map(|i| &i.status),
+                "status",
+            )?,
+        ),
+        (
+            "priority_id",
+            lookup(
+                &meta.priorities,
+                &g("priority"),
+                cur.map(|i| &i.priority),
+                "priority",
+            )?,
+        ),
         (
             "assigned_to_id",
-            lookup(&meta.users, &g("assigned_to"), cur.and_then(|i| i.assigned_to.as_ref()), "assigned_to")?,
+            lookup(
+                &meta.users,
+                &g("assigned_to"),
+                cur.and_then(|i| i.assigned_to.as_ref()),
+                "assigned_to",
+            )?,
         ),
         (
             "category_id",
-            lookup(&meta.categories, &g("category"), cur.and_then(|i| i.category.as_ref()), "category")?,
+            lookup(
+                &meta.categories,
+                &g("category"),
+                cur.and_then(|i| i.category.as_ref()),
+                "category",
+            )?,
         ),
         (
             "fixed_version_id",
-            lookup(&meta.versions, &g("fixed_version"), cur.and_then(|i| i.fixed_version.as_ref()), "fixed_version")?,
+            lookup(
+                &meta.versions,
+                &g("fixed_version"),
+                cur.and_then(|i| i.fixed_version.as_ref()),
+                "fixed_version",
+            )?,
         ),
-        ("parent_issue_id", g("parent_issue_id").trim_start_matches('#').to_string()),
+        (
+            "parent_issue_id",
+            g("parent_issue_id").trim_start_matches('#').to_string(),
+        ),
         ("start_date", g("start_date")),
         ("due_date", g("due_date")),
         ("done_ratio", g("done_ratio")),
@@ -230,13 +305,21 @@ pub fn parse_issue(text: &str, meta: &Meta, cur: Option<&Issue>) -> Result<Parse
             let n = scalar(k);
             let id = cur
                 .and_then(|i| i.custom_fields.iter().find(|c| c.name == n).map(|c| c.id))
-                .or_else(|| meta.custom_fields.iter().find(|c| c.name == n).map(|c| c.id))
+                .or_else(|| {
+                    meta.custom_fields
+                        .iter()
+                        .find(|c| c.name == n)
+                        .map(|c| c.id)
+                })
                 .ok_or_else(|| anyhow!("custom_fields: '{n}' not found"))?;
             cfs.insert(id, cf_json(&serde_json::to_value(v)?));
         }
     }
     let updated_on = Some(g("updated_on")).filter(|s| !s.is_empty());
-    Ok(Parsed { updated_on, payload: Payload { fields, cfs } })
+    Ok(Parsed {
+        updated_on,
+        payload: Payload { fields, cfs },
+    })
 }
 
 #[cfg(test)]
@@ -256,7 +339,16 @@ mod tests {
         }))
         .unwrap();
         let meta = Meta {
-            statuses: vec![IdName { id: 1, name: "New".into() }, IdName { id: 2, name: status.into() }],
+            statuses: vec![
+                IdName {
+                    id: 1,
+                    name: "New".into(),
+                },
+                IdName {
+                    id: 2,
+                    name: status.into(),
+                },
+            ],
             ..Default::default()
         };
         let base = payload_of(&i);
@@ -269,8 +361,14 @@ mod tests {
         let edited = text
             .replace("status: New", &format!("status: {status}"))
             .replace(&format!("{cf}: ACME"), &format!("{cf}: Foo"));
-        let d = parse_issue(&edited, &meta, Some(&i)).unwrap().payload.diff(Some(&base));
-        assert_eq!(J::Object(d), json!({"status_id": "2", "custom_fields": [{"id": 3, "value": "Foo"}]}));
+        let d = parse_issue(&edited, &meta, Some(&i))
+            .unwrap()
+            .payload
+            .diff(Some(&base));
+        assert_eq!(
+            J::Object(d),
+            json!({"status_id": "2", "custom_fields": [{"id": 3, "value": "Foo"}]})
+        );
 
         assert!(parse_issue("---\nstatus: Unknown\n---\n", &meta, Some(&i)).is_err());
         assert_eq!(parse_comment(&render_comment(&i.journals[0])), note);
@@ -279,11 +377,25 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        check_roundtrip("Login: fails", "Desc\r\nLine 2\r\n", "Customer", "In Progress", "Hello", "no front matter");
+        check_roundtrip(
+            "Login: fails",
+            "Desc\r\nLine 2\r\n",
+            "Customer",
+            "In Progress",
+            "Hello",
+            "no front matter",
+        );
     }
 
     #[test]
     fn roundtrip_multibyte() {
-        check_roundtrip("ログイン: できない", "説明\r\n2行目\r\n", "顧客名", "進行中", "こんにちは", "front matterなし");
+        check_roundtrip(
+            "ログイン: できない",
+            "説明\r\n2行目\r\n",
+            "顧客名",
+            "進行中",
+            "こんにちは",
+            "front matterなし",
+        );
     }
 }

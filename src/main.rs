@@ -29,11 +29,16 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let key = std::env::var("REDMINE_API_KEY").context("Please set the REDMINE_API_KEY environment variable")?;
+    let key = std::env::var("REDMINE_API_KEY")
+        .context("Please set the REDMINE_API_KEY environment variable")?;
     let api = redmine::Api::new(&args.url, &key)?;
     let meta = api.meta(&args.project)?;
     let trackers: Vec<_> = meta.trackers.iter().map(|t| t.name.as_str()).collect();
-    println!("project #{} trackers: {}", meta.project_id, trackers.join(", "));
+    println!(
+        "project #{} trackers: {}",
+        meta.project_id,
+        trackers.join(", ")
+    );
     let fs = fs::RedmineFs::new(api, meta, args.filter.trim_matches('&').to_string());
     #[cfg(windows)]
     return win::run(fs, &args.mount);

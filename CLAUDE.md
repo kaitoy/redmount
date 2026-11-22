@@ -10,6 +10,7 @@ redmount mounts one Redmine project as a Windows drive via WinFsp, or as a direc
 cargo build                     # Windows: needs WinFsp 2.1+ and VS Build Tools (C++); macOS: macFUSE + pkgconf; Linux: nothing extra
 cargo test                      # unit tests (markdown round-trip, fs name/time helpers)
 cargo test roundtrip_multibyte  # single test by name
+git config core.hooksPath .githooks  # once per clone: pre-commit runs cargo fmt --check + clippy -D warnings
 $env:REDMINE_API_KEY = "..."; cargo run --release -- --url https://redmine.example.com --project myproj --mount R:
 ```
 

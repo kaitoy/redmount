@@ -5,11 +5,13 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use windows::Win32::Foundation::{
     STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_END_OF_FILE, STATUS_IO_DEVICE_ERROR,
-    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND,
 };
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
-    DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo, WideNameInfo,
+    DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
+    WideNameInfo,
 };
 use winfsp::host::{FileSystemHost, VolumeParams};
 use winfsp::{FspError, U16CStr};
@@ -56,7 +58,9 @@ pub struct Handle {
 
 impl Handle {
     fn new(path: String) -> Self {
-        Handle { path: Mutex::new(path) }
+        Handle {
+            path: Mutex::new(path),
+        }
     }
     fn path(&self) -> String {
         self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -77,7 +81,13 @@ impl WinFs {
             && buf.len() >= self.sd.len()
         {
             // SAFETY: buf holds at least sd.len() bytes.
-            unsafe { std::ptr::copy_nonoverlapping(self.sd.as_ptr(), buf.as_mut_ptr().cast::<u8>(), self.sd.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.sd.as_ptr(),
+                    buf.as_mut_ptr().cast::<u8>(),
+                    self.sd.len(),
+                )
+            };
         }
     }
 }
@@ -129,12 +139,17 @@ impl FileSystemContext for WinFs {
         file_info: &mut OpenFileInfo,
     ) -> Res<Handle> {
         let path = file_name.to_string_lossy();
-        *file_info.as_mut() = fi(self.fs.create(&path, create_options & FILE_DIRECTORY_FILE != 0)?);
+        *file_info.as_mut() = fi(self
+            .fs
+            .create(&path, create_options & FILE_DIRECTORY_FILE != 0)?);
         Ok(Handle::new(path))
     }
 
     fn cleanup(&self, h: &Handle, _file_name: Option<&U16CStr>, flags: u32) {
-        self.fs.cleanup(&h.path(), FspCleanupFlags::FspCleanupDelete.is_flagged(flags));
+        self.fs.cleanup(
+            &h.path(),
+            FspCleanupFlags::FspCleanupDelete.is_flagged(flags),
+        );
     }
 
     fn flush(&self, h: Option<&Handle>, file_info: &mut FileInfo) -> Res<()> {
@@ -187,7 +202,10 @@ impl FileSystemContext for WinFs {
                 let m = m.to_string_lossy();
                 match entries.iter().position(|(n, _)| *n == m) {
                     Some(i) => i + 1,
-                    None => entries.iter().position(|(n, _)| n.to_lowercase() > m.to_lowercase()).unwrap_or(entries.len()),
+                    None => entries
+                        .iter()
+                        .position(|(n, _)| n.to_lowercase() > m.to_lowercase())
+                        .unwrap_or(entries.len()),
                 }
             }
         };
@@ -204,9 +222,16 @@ impl FileSystemContext for WinFs {
         Ok(cursor)
     }
 
-    fn rename(&self, h: &Handle, file_name: &U16CStr, new_file_name: &U16CStr, replace_if_exists: bool) -> Res<()> {
+    fn rename(
+        &self,
+        h: &Handle,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> Res<()> {
         let to = new_file_name.to_string_lossy();
-        self.fs.rename(&file_name.to_string_lossy(), &to, replace_if_exists)?;
+        self.fs
+            .rename(&file_name.to_string_lossy(), &to, replace_if_exists)?;
         h.set_path(to);
         Ok(())
     }
@@ -231,7 +256,13 @@ impl FileSystemContext for WinFs {
         Ok(())
     }
 
-    fn set_file_size(&self, h: &Handle, new_size: u64, set_allocation_size: bool, file_info: &mut FileInfo) -> Res<()> {
+    fn set_file_size(
+        &self,
+        h: &Handle,
+        new_size: u64,
+        set_allocation_size: bool,
+        file_info: &mut FileInfo,
+    ) -> Res<()> {
         *file_info = fi(self.fs.set_size(&h.path(), new_size, set_allocation_size)?);
         Ok(())
     }
@@ -253,7 +284,9 @@ impl FileSystemContext for WinFs {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> Res<u32> {
-        let (n, s) = self.fs.write(&h.path(), buffer, offset, write_to_eof, constrained_io)?;
+        let (n, s) = self
+            .fs
+            .write(&h.path(), buffer, offset, write_to_eof, constrained_io)?;
         *file_info = fi(s);
         Ok(n as u32)
     }
@@ -269,9 +302,17 @@ impl FileSystemContext for WinFs {
 pub fn run(fs: RedmineFs, mount: &str) -> anyhow::Result<()> {
     // winfsp_init loads winfsp-x64.dll from the DLL search path.
     // ponytail: assumes the default WinFsp install dir; read HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir if it moves
-    let bin = format!(r"{}\WinFsp\bin", std::env::var("ProgramFiles(x86)").unwrap_or_default());
+    let bin = format!(
+        r"{}\WinFsp\bin",
+        std::env::var("ProgramFiles(x86)").unwrap_or_default()
+    );
     // SAFETY: still single-threaded here.
-    unsafe { std::env::set_var("PATH", format!("{bin};{}", std::env::var("PATH").unwrap_or_default())) };
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!("{bin};{}", std::env::var("PATH").unwrap_or_default()),
+        )
+    };
     let _init = winfsp::winfsp_init().context("Failed to load WinFsp. Please install WinFsp")?;
     let mut vp = VolumeParams::new();
     vp.sector_size(4096)
@@ -285,7 +326,13 @@ pub fn run(fs: RedmineFs, mount: &str) -> anyhow::Result<()> {
         .flush_and_purge_on_cleanup(true)
         .file_info_timeout(1000)
         .filesystem_name("redmount");
-    let mut host: FileSystemHost<WinFs> = FileSystemHost::new(vp, WinFs { fs, sd: security_descriptor()? })?;
+    let mut host: FileSystemHost<WinFs> = FileSystemHost::new(
+        vp,
+        WinFs {
+            fs,
+            sd: security_descriptor()?,
+        },
+    )?;
     host.mount(mount)?;
     host.start()?;
     println!("Mounted on {mount}. Press Enter to unmount.");
@@ -310,6 +357,9 @@ fn security_descriptor() -> anyhow::Result<Vec<u8>> {
             &mut sd,
             None,
         )?;
-        Ok(std::slice::from_raw_parts(sd.0 as *const u8, GetSecurityDescriptorLength(sd) as usize).to_vec())
+        Ok(
+            std::slice::from_raw_parts(sd.0 as *const u8, GetSecurityDescriptorLength(sd) as usize)
+                .to_vec(),
+        )
     }
 }

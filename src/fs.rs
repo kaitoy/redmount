@@ -69,7 +69,15 @@ enum Node {
 impl Node {
     #[cfg(windows)]
     fn is_dir(self) -> bool {
-        matches!(self, Node::Root | Node::Tracker(_) | Node::Closed(_) | Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_))
+        matches!(
+            self,
+            Node::Root
+                | Node::Tracker(_)
+                | Node::Closed(_)
+                | Node::IssueDir(_)
+                | Node::Pending(_)
+                | Node::AttachDir(_)
+        )
     }
 }
 
@@ -88,7 +96,15 @@ struct Entry {
 
 impl Entry {
     fn new(name: &str, dir: bool, data: Vec<u8>, transient: bool) -> Self {
-        Entry { name: name.into(), dir, data, dirty: false, opens: 0, transient, time: now() }
+        Entry {
+            name: name.into(),
+            dir,
+            data,
+            dirty: false,
+            opens: 0,
+            transient,
+            time: now(),
+        }
     }
 }
 
@@ -151,7 +167,13 @@ pub struct RedmineFs {
 
 impl RedmineFs {
     pub fn new(api: Api, meta: Meta, filter: String) -> Self {
-        Self { api, meta, started: now(), filter, st: Mutex::default() }
+        Self {
+            api,
+            meta,
+            started: now(),
+            filter,
+            st: Mutex::default(),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -184,14 +206,27 @@ impl RedmineFs {
             Some(l) if l.full.elapsed() < FULL && !l.cursor.is_empty() => {
                 let q = format!("{}&status_id=*&updated_on=%3E%3D{}", self.filter, l.cursor);
                 let changed = self.api.issues(pid, &q).map_err(io)?;
-                l.merge(changed, tracker, |i| self.meta.closed_statuses.contains(&i.status.id) == closed);
+                l.merge(changed, tracker, |i| {
+                    self.meta.closed_statuses.contains(&i.status.id) == closed
+                });
                 l.checked = Some(Instant::now());
             }
             _ => {
                 let status = if closed { "closed" } else { "open" };
-                let v = self.api.issues(pid, &format!("{}&tracker_id={tracker}&status_id={status}", self.filter)).map_err(io)?;
+                let v = self
+                    .api
+                    .issues(
+                        pid,
+                        &format!("{}&tracker_id={tracker}&status_id={status}", self.filter),
+                    )
+                    .map_err(io)?;
                 let now = Instant::now();
-                let mut l = List { checked: Some(now), full: now, cursor: String::new(), issues: BTreeMap::new() };
+                let mut l = List {
+                    checked: Some(now),
+                    full: now,
+                    cursor: String::new(),
+                    issues: BTreeMap::new(),
+                };
                 l.merge(v, tracker, |_| true);
                 st.lists.insert(key, l);
             }
@@ -219,9 +254,20 @@ impl RedmineFs {
 
     /// Path -> node + overlay key. `None` = doesn't exist.
     fn resolve(&self, st: &mut State, path: &str) -> Res<Option<(Node, String)>> {
-        let mut c: Vec<String> = path.split('\\').filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect();
-        let Some(first) = c.first() else { return Ok(Some((Node::Root, String::new()))) };
-        let Some(t) = self.meta.trackers.iter().find(|t| sanitize(&t.name, 100).to_lowercase() == *first) else {
+        let mut c: Vec<String> = path
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect();
+        let Some(first) = c.first() else {
+            return Ok(Some((Node::Root, String::new())));
+        };
+        let Some(t) = self
+            .meta
+            .trackers
+            .iter()
+            .find(|t| sanitize(&t.name, 100).to_lowercase() == *first)
+        else {
             return Ok(None);
         };
         let tkey = format!("\\{first}");
@@ -236,7 +282,8 @@ impl RedmineFs {
             }
             c.remove(1);
         }
-        let local = |st: &State, key: String| st.local.contains_key(&key).then_some((Node::Local, key));
+        let local =
+            |st: &State, key: String| st.local.contains_key(&key).then_some((Node::Local, key));
         let pkey = format!("{tkey}\\{}", c[1]);
         if !closed && st.local.contains_key(&pkey) {
             if c.len() == 2 {
@@ -244,9 +291,17 @@ impl RedmineFs {
             }
             return Ok(local(st, format!("{pkey}\\{}", c[2..].join("\\"))));
         }
-        let alias = if closed { None } else { st.aliases.get(&pkey).copied() };
-        let Some(id) = alias.or_else(|| leading_id(&c[1])) else { return Ok(None) };
-        let Some(issue) = self.issue(st, id)? else { return Ok(None) };
+        let alias = if closed {
+            None
+        } else {
+            st.aliases.get(&pkey).copied()
+        };
+        let Some(id) = alias.or_else(|| leading_id(&c[1])) else {
+            return Ok(None);
+        };
+        let Some(issue) = self.issue(st, id)? else {
+            return Ok(None);
+        };
         if c.len() == 2 {
             return Ok(Some((Node::IssueDir(id), format!("#{id}"))));
         }
@@ -275,10 +330,13 @@ impl RedmineFs {
 
     fn render(&self, st: &mut State, node: Node) -> Res<Vec<u8>> {
         Ok(match node {
-            Node::IssueMd(id) => markdown::render_issue(&self.must_issue(st, id)?, &self.meta).into_bytes(),
+            Node::IssueMd(id) => {
+                markdown::render_issue(&self.must_issue(st, id)?, &self.meta).into_bytes()
+            }
             Node::Comment(id, j) => {
                 let i = self.must_issue(st, id)?;
-                markdown::render_comment(i.journals.iter().find(|x| x.id == j).ok_or_else(nf)?).into_bytes()
+                markdown::render_comment(i.journals.iter().find(|x| x.id == j).ok_or_else(nf)?)
+                    .into_bytes()
             }
             _ => Vec::new(),
         })
@@ -289,7 +347,9 @@ impl RedmineFs {
             return Ok(finfo(e.dir, e.data.len() as u64, e.time, e.time));
         }
         Ok(match node {
-            Node::Root | Node::Tracker(_) | Node::Closed(_) => finfo(true, 0, self.started, self.started),
+            Node::Root | Node::Tracker(_) | Node::Closed(_) => {
+                finfo(true, 0, self.started, self.started)
+            }
             Node::IssueDir(id) | Node::AttachDir(id) => {
                 let i = self.must_issue(st, id)?;
                 finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))
@@ -302,7 +362,11 @@ impl RedmineFs {
             Node::Comment(id, j) => {
                 let len = self.render(st, node)?.len() as u64;
                 let i = self.must_issue(st, id)?;
-                let t = i.journals.iter().find(|x| x.id == j).map_or(EPOCH, |x| ft(&x.created_on));
+                let t = i
+                    .journals
+                    .iter()
+                    .find(|x| x.id == j)
+                    .map_or(EPOCH, |x| ft(&x.created_on));
                 finfo(false, len, t, t)
             }
             Node::Attachment(id, att) => {
@@ -319,29 +383,50 @@ impl RedmineFs {
         let mut out: Vec<(String, Stat)> = match node {
             Node::Root => {
                 let fi = finfo(true, 0, self.started, self.started);
-                self.meta.trackers.iter().map(|t| (sanitize(&t.name, 100), fi)).collect()
+                self.meta
+                    .trackers
+                    .iter()
+                    .map(|t| (sanitize(&t.name, 100), fi))
+                    .collect()
             }
             Node::Tracker(tid) | Node::Closed(tid) => {
                 let closed = matches!(node, Node::Closed(_));
                 let mut v: Vec<_> = self
                     .list(st, tid, closed)?
                     .iter()
-                    .map(|i| (folder(i), finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))))
+                    .map(|i| {
+                        (
+                            folder(i),
+                            finfo(true, 0, ft(&i.created_on), ft(&i.updated_on)),
+                        )
+                    })
                     .collect();
                 if !closed {
-                    v.push((CLOSED.to_string(), finfo(true, 0, self.started, self.started)));
+                    v.push((
+                        CLOSED.to_string(),
+                        finfo(true, 0, self.started, self.started),
+                    ));
                 }
                 v
             }
             Node::IssueDir(id) => {
                 let i = self.must_issue(st, id)?;
                 let mut v = vec![
-                    ("issue.md".to_string(), self.info(st, Node::IssueMd(id), &format!("#{id}\\issue.md"))?),
-                    ("attachments".to_string(), self.info(st, Node::AttachDir(id), "")?),
+                    (
+                        "issue.md".to_string(),
+                        self.info(st, Node::IssueMd(id), &format!("#{id}\\issue.md"))?,
+                    ),
+                    (
+                        "attachments".to_string(),
+                        self.info(st, Node::AttachDir(id), "")?,
+                    ),
                 ];
                 for j in i.journals.iter().filter(|j| has_notes(j)) {
                     let name = format!("comment_{}.md", j.id);
-                    v.push((name.clone(), self.info(st, Node::Comment(id, j.id), &format!("#{id}\\{name}"))?));
+                    v.push((
+                        name.clone(),
+                        self.info(st, Node::Comment(id, j.id), &format!("#{id}\\{name}"))?,
+                    ));
                 }
                 v
             }
@@ -359,7 +444,10 @@ impl RedmineFs {
             _ => return Err(E::NotDir),
         };
         for (name, fi) in local_children(st, key) {
-            if !out.iter().any(|(n, _)| n.to_lowercase() == name.to_lowercase()) {
+            if !out
+                .iter()
+                .any(|(n, _)| n.to_lowercase() == name.to_lowercase())
+            {
                 out.push((name, fi));
             }
         }
@@ -368,11 +456,20 @@ impl RedmineFs {
     }
 
     /// Writable buffer for a file (creates the edit buffer of issue.md / comments on demand).
-    fn entry<'a>(&self, st: &'a mut State, node: Node, key: &str, path: &str) -> Res<&'a mut Entry> {
+    fn entry<'a>(
+        &self,
+        st: &'a mut State,
+        node: Node,
+        key: &str,
+        path: &str,
+    ) -> Res<&'a mut Entry> {
         match node {
             Node::IssueMd(_) | Node::Comment(..) if !st.local.contains_key(key) => {
                 let data = self.render(st, node)?;
-                st.local.insert(key.to_string(), Entry::new(split_parent(path).1, false, data, true));
+                st.local.insert(
+                    key.to_string(),
+                    Entry::new(split_parent(path).1, false, data, true),
+                );
             }
             Node::IssueMd(_) | Node::Comment(..) | Node::Local => {}
             _ => return Err(E::Denied),
@@ -416,12 +513,22 @@ impl RedmineFs {
                 let msg = format!(
                     "Failed to send {path}. Your edits remain on this drive (they will be lost on unmount).\r\n\r\n{e:#}\r\n"
                 );
-                st.local.insert(err_key, Entry::new(&format!("{name}.error.txt"), false, msg.into_bytes(), false));
+                st.local.insert(
+                    err_key,
+                    Entry::new(&format!("{name}.error.txt"), false, msg.into_bytes(), false),
+                );
             }
         }
     }
 
-    fn send(&self, st: &mut State, node: Node, path: &str, name: &str, data: Vec<u8>) -> anyhow::Result<Done> {
+    fn send(
+        &self,
+        st: &mut State,
+        node: Node,
+        path: &str,
+        name: &str,
+        data: Vec<u8>,
+    ) -> anyhow::Result<Done> {
         match node {
             Node::IssueMd(id) => {
                 let cur = self.api.issue(id)?.context("Issue not found")?;
@@ -435,17 +542,27 @@ impl RedmineFs {
                 }
                 let body = p.payload.diff(Some(&markdown::payload_of(&cur)));
                 if !body.is_empty() {
-                    self.api.send(Method::PUT, &format!("/issues/{id}.json"), Some(json!({ "issue": body })))?;
+                    self.api.send(
+                        Method::PUT,
+                        &format!("/issues/{id}.json"),
+                        Some(json!({ "issue": body })),
+                    )?;
                 }
                 Ok(Done::Updated(id))
             }
             Node::Comment(id, j) => {
                 let notes = markdown::parse_comment(utf8(&data)?);
-                self.api.send(Method::PUT, &format!("/journals/{j}.json"), Some(json!({ "journal": { "notes": notes } })))?;
+                self.api.send(
+                    Method::PUT,
+                    &format!("/journals/{j}.json"),
+                    Some(json!({ "journal": { "notes": notes } })),
+                )?;
                 Ok(Done::Updated(id))
             }
             Node::Local => {
-                let Some((parent, pkey)) = self.resolve(st, split_parent(path).0).map_err(|_| anyhow!("resolve failed"))?
+                let Some((parent, pkey)) = self
+                    .resolve(st, split_parent(path).0)
+                    .map_err(|_| anyhow!("resolve failed"))?
                 else {
                     return Ok(Done::Nothing);
                 };
@@ -454,13 +571,21 @@ impl RedmineFs {
                     Node::Pending(tracker) if lname == "issue.md" => {
                         let mut p = markdown::parse_issue(utf8(&data)?, &self.meta, None)?.payload;
                         if p.fields.get("subject").is_none_or(|s| s.is_empty()) {
-                            let folder = st.local.get(&pkey).map(|e| e.name.clone()).unwrap_or_default();
+                            let folder = st
+                                .local
+                                .get(&pkey)
+                                .map(|e| e.name.clone())
+                                .unwrap_or_default();
                             p.fields.insert("subject", folder);
                         }
                         let mut body = p.diff(None);
                         body.insert("project_id".into(), json!(self.meta.project_id));
                         body.insert("tracker_id".into(), json!(tracker));
-                        let v = self.api.send(Method::POST, "/issues.json", Some(json!({ "issue": body })))?;
+                        let v = self.api.send(
+                            Method::POST,
+                            "/issues.json",
+                            Some(json!({ "issue": body })),
+                        )?;
                         let id = v["issue"]["id"].as_u64().context("No id in response")?;
                         Ok(Done::Created(id, pkey))
                     }
@@ -469,13 +594,18 @@ impl RedmineFs {
                         if notes.is_empty() {
                             return Ok(Done::Nothing);
                         }
-                        self.api.send(Method::PUT, &format!("/issues/{id}.json"), Some(json!({ "issue": { "notes": notes } })))?;
+                        self.api.send(
+                            Method::PUT,
+                            &format!("/issues/{id}.json"),
+                            Some(json!({ "issue": { "notes": notes } })),
+                        )?;
                         Ok(Done::Consumed(id))
                     }
                     Node::AttachDir(id) if !data.is_empty() => {
                         let token = self.api.upload(name, data)?;
                         let up = json!({ "issue": { "uploads": [{ "token": token, "filename": name }] } });
-                        self.api.send(Method::PUT, &format!("/issues/{id}.json"), Some(up))?;
+                        self.api
+                            .send(Method::PUT, &format!("/issues/{id}.json"), Some(up))?;
                         Ok(Done::Consumed(id))
                     }
                     _ => Ok(Done::Nothing),
@@ -522,7 +652,9 @@ impl RedmineFs {
 
     pub fn close(&self, path: &str) {
         let mut st = self.lock();
-        let Ok(Some((_, key))) = self.resolve(&mut st, path) else { return };
+        let Ok(Some((_, key))) = self.resolve(&mut st, path) else {
+            return;
+        };
         let idle = st.local.get_mut(&key).is_some_and(|e| {
             e.opens = e.opens.saturating_sub(1);
             e.opens == 0 && e.transient && !e.dirty
@@ -538,11 +670,14 @@ impl RedmineFs {
         let mut st = self.lock();
         let (pnode, pkey) = self.resolve(&mut st, parent)?.ok_or(E::PathNotFound)?;
         match (pnode, dir) {
-            (Node::Tracker(_), true) | (Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_), false) => {}
+            (Node::Tracker(_), true)
+            | (Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_), false) => {}
             _ => return Err(E::Denied),
         }
         let key = format!("{pkey}\\{}", name.to_lowercase());
-        if st.local.contains_key(&key) || (matches!(pnode, Node::Tracker(_)) && name.eq_ignore_ascii_case(CLOSED)) {
+        if st.local.contains_key(&key)
+            || (matches!(pnode, Node::Tracker(_)) && name.eq_ignore_ascii_case(CLOSED))
+        {
             return Err(E::Exists);
         }
         let mut e = Entry::new(name, dir, Vec::new(), false);
@@ -550,7 +685,10 @@ impl RedmineFs {
         st.local.insert(key.clone(), e);
         if dir {
             let tpl = markdown::template(&self.meta).into_bytes();
-            st.local.insert(format!("{key}\\issue.md"), Entry::new("issue.md", false, tpl, false));
+            st.local.insert(
+                format!("{key}\\issue.md"),
+                Entry::new("issue.md", false, tpl, false),
+            );
         }
         self.info(&mut st, Node::Local, &key)
     }
@@ -558,7 +696,9 @@ impl RedmineFs {
     /// A handle is done: delete the file (`check_delete` passed) or send its unsent edits.
     pub fn cleanup(&self, path: &str, delete: bool) {
         let mut st = self.lock();
-        let Ok(Some((node, key))) = self.resolve(&mut st, path) else { return };
+        let Ok(Some((node, key))) = self.resolve(&mut st, path) else {
+            return;
+        };
         if delete {
             Self::remove(&mut st, &key);
         } else if st.local.get(&key).is_some_and(|e| e.dirty) {
@@ -574,7 +714,9 @@ impl RedmineFs {
             Node::Pending(_) if local_children(&st, &key).is_empty() => Ok(()),
             Node::Pending(_) => Err(E::NotEmpty),
             // only unsent edits can be "deleted" (= discarded)
-            Node::IssueMd(_) | Node::Comment(..) if st.local.get(&key).is_some_and(|e| e.dirty) => Ok(()),
+            Node::IssueMd(_) | Node::Comment(..) if st.local.get(&key).is_some_and(|e| e.dirty) => {
+                Ok(())
+            }
             _ => Err(E::Denied),
         }
     }
@@ -608,18 +750,33 @@ impl RedmineFs {
         let new_key = match (node, pnode, &target) {
             // case-only rename
             (Node::Local | Node::Pending(_), _, Some((_, k))) if *k == key => key.clone(),
-            (Node::Pending(t), Node::Tracker(pt), None) if t == pt => format!("{pkey}\\{}", to_name.to_lowercase()),
+            (Node::Pending(t), Node::Tracker(pt), None) if t == pt => {
+                format!("{pkey}\\{}", to_name.to_lowercase())
+            }
             (Node::Local, Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_), None) => {
                 format!("{pkey}\\{}", to_name.to_lowercase())
             }
             // atomic save: temp file -> issue.md / comment
-            (Node::Local, _, Some((Node::Local | Node::IssueMd(_) | Node::Comment(..), k))) if replace_if_exists => k.clone(),
+            (Node::Local, _, Some((Node::Local | Node::IssueMd(_) | Node::Comment(..), k)))
+                if replace_if_exists =>
+            {
+                k.clone()
+            }
             (_, _, Some(_)) => return Err(E::Exists),
             _ => return Err(E::Denied),
         };
-        let replaced_opens = if new_key == key { 0 } else { st.local.remove(&new_key).map_or(0, |e| e.opens) };
+        let replaced_opens = if new_key == key {
+            0
+        } else {
+            st.local.remove(&new_key).map_or(0, |e| e.opens)
+        };
         let prefix = format!("{key}\\");
-        let moved: Vec<String> = st.local.keys().filter(|k| **k == key || k.starts_with(&prefix)).cloned().collect();
+        let moved: Vec<String> = st
+            .local
+            .keys()
+            .filter(|k| **k == key || k.starts_with(&prefix))
+            .cloned()
+            .collect();
         for k in moved {
             let mut e = st.local.remove(&k).expect("key listed above");
             if k == key {
@@ -667,12 +824,27 @@ impl RedmineFs {
     }
 
     /// `constrained`: never grow the file (Windows paging I/O).
-    pub fn write(&self, path: &str, buffer: &[u8], offset: u64, to_eof: bool, constrained: bool) -> Res<(usize, Stat)> {
+    pub fn write(
+        &self,
+        path: &str,
+        buffer: &[u8],
+        offset: u64,
+        to_eof: bool,
+        constrained: bool,
+    ) -> Res<(usize, Stat)> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
         let e = self.entry(&mut st, node, &key, path)?;
-        let off = if to_eof { e.data.len() } else { offset as usize };
-        let len = if constrained { buffer.len().min(e.data.len().saturating_sub(off)) } else { buffer.len() };
+        let off = if to_eof {
+            e.data.len()
+        } else {
+            offset as usize
+        };
+        let len = if constrained {
+            buffer.len().min(e.data.len().saturating_sub(off))
+        } else {
+            buffer.len()
+        };
         if len > 0 {
             if off + len > e.data.len() {
                 e.data.resize(off + len, 0);
@@ -690,7 +862,12 @@ fn local_children(st: &State, key: &str) -> Vec<(String, Stat)> {
         .range(prefix.clone()..)
         .take_while(|(k, _)| k.starts_with(&prefix))
         .filter(|(k, _)| !k[prefix.len()..].contains('\\'))
-        .map(|(_, e)| (e.name.clone(), finfo(e.dir, e.data.len() as u64, e.time, e.time)))
+        .map(|(_, e)| {
+            (
+                e.name.clone(),
+                finfo(e.dir, e.data.len() as u64, e.time, e.time),
+            )
+        })
         .collect()
 }
 
@@ -714,14 +891,22 @@ fn has_notes(j: &Journal) -> bool {
 fn sanitize(s: &str, max: usize) -> String {
     let s: String = s
         .chars()
-        .map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || r#"\/:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .take(max)
         .collect();
     s.trim_end_matches(['.', ' ']).to_string()
 }
 
 fn folder(i: &Issue) -> String {
-    format!("{} {}", i.id, sanitize(&i.subject, 60)).trim_end().to_string()
+    format!("{} {}", i.id, sanitize(&i.subject, 60))
+        .trim_end()
+        .to_string()
 }
 
 fn leading_id(s: &str) -> Option<u64> {
@@ -729,7 +914,10 @@ fn leading_id(s: &str) -> Option<u64> {
 }
 
 fn comment_id(name: &str) -> Option<u64> {
-    name.strip_prefix("comment_")?.strip_suffix(".md")?.parse().ok()
+    name.strip_prefix("comment_")?
+        .strip_suffix(".md")?
+        .parse()
+        .ok()
 }
 
 /// Only this name in an issue folder is posted as a new comment, so copied-in `.md` files aren't.
@@ -742,18 +930,38 @@ fn att_names(i: &Issue) -> Vec<(String, &Attachment)> {
     i.attachments
         .iter()
         .map(|a| {
-            let dup = i.attachments.iter().filter(|b| b.filename.eq_ignore_ascii_case(&a.filename)).count() > 1;
-            (if dup { format!("{}_{}", a.id, a.filename) } else { a.filename.clone() }, a)
+            let dup = i
+                .attachments
+                .iter()
+                .filter(|b| b.filename.eq_ignore_ascii_case(&a.filename))
+                .count()
+                > 1;
+            (
+                if dup {
+                    format!("{}_{}", a.id, a.filename)
+                } else {
+                    a.filename.clone()
+                },
+                a,
+            )
         })
         .collect()
 }
 
 fn finfo(dir: bool, size: u64, created: u64, modified: u64) -> Stat {
-    Stat { dir, size, created, modified }
+    Stat {
+        dir,
+        size,
+        created,
+        modified,
+    }
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64 / 100) + EPOCH
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64 / 100)
+        + EPOCH
 }
 
 /// "2026-11-20T09:00:00Z" -> FILETIME (offset suffix ignored; Redmine's API returns UTC).
@@ -785,7 +993,11 @@ mod tests {
         assert_eq!(leading_id("New folder"), None);
         assert_eq!(comment_id("comment_45.md"), Some(45));
         assert!(is_new_comment("comment.md") && is_new_comment("Comment.MD"));
-        assert!(!is_new_comment("memo.md") && !is_new_comment("comment_45.md") && !is_new_comment("._comment.md"));
+        assert!(
+            !is_new_comment("memo.md")
+                && !is_new_comment("comment_45.md")
+                && !is_new_comment("._comment.md")
+        );
         assert_eq!(sanitize("a/b: c?. ", 60), "a_b_ c_");
     }
 
@@ -799,8 +1011,20 @@ mod tests {
             .unwrap()
         };
         let open = |i: &Issue| i.status.id != 5;
-        let mut l = List { checked: None, full: Instant::now(), cursor: String::new(), issues: BTreeMap::new() };
-        l.merge(vec![issue(1, 1, 1, "2026-01-01T00:00:00Z"), issue(2, 1, 1, "2026-01-03T00:00:00Z")], 1, |_| true);
+        let mut l = List {
+            checked: None,
+            full: Instant::now(),
+            cursor: String::new(),
+            issues: BTreeMap::new(),
+        };
+        l.merge(
+            vec![
+                issue(1, 1, 1, "2026-01-01T00:00:00Z"),
+                issue(2, 1, 1, "2026-01-03T00:00:00Z"),
+            ],
+            1,
+            |_| true,
+        );
         assert_eq!(l.cursor, "2026-01-03T00:00:00Z");
         // 1 closed, 2 moved to another tracker, 3 new, 4 belongs elsewhere
         l.merge(

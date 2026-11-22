@@ -24,6 +24,8 @@ jobs:
       # Linux needs no FUSE headers (fuser mounts via fusermount); macOS links macFUSE's libfuse.
       - if: runner.os == 'macOS'
         run: brew install --cask macfuse && brew install pkgconf
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
       - uses: taiki-e/install-action@v2
