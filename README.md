@@ -36,7 +36,7 @@ Folders are resolved by their leading ID, so `R:\Bug\123` works too, whether or 
 Listings are refreshed every 30 seconds by fetching only the issues updated since the last fetch. Deleted issues and issues moved to another project disappear from listings within 10 minutes.
 
 ## Writing
-A file is sent to Redmine when it is saved and closed.
+A file is sent to Redmine when it is saved and closed. Editors that save by writing a temp file and renaming it over the target send on the rename. Sending is synchronous, so the save does not finish until Redmine responds. A program that keeps the file open sends nothing until it closes it.
 
 | Action | Result |
 |---|---|
