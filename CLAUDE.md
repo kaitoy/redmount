@@ -41,5 +41,6 @@ Adapters only translate types; behavior changes belong in `fs.rs`.
 
 ## Conventions
 
+- The plugin (`plugin.json`, `.claude-plugin/marketplace.json`, shipping `skills/`) is versioned separately from `Cargo.toml`. When `skills/` changes, bump `version` in both manifests together; Claude Code users only get updates on a version bump.
 - Deliberate shortcuts are marked with `// ponytail:` comments naming the limit and upgrade path; keep that style.
 - Errors to the kernel: map with `err(STATUS_*)` / `nf()` / `io()`; user-visible send errors go into `.error.txt`, not just stderr.

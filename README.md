@@ -54,7 +54,14 @@ A file is sent to Redmine when it is saved and closed. Editors that save by writ
 - Issues, comments and attachments cannot be deleted.
 
 ## Agent Skill
-[`skills/redmount/`](skills/redmount/SKILL.md) is an [Agent Skill](https://agentskills.io/) that teaches AI agents the rules above. Copy the folder to `~/.claude/skills/` (or a project's `.claude/skills/`, or your agent's skills directory) and tell the agent where the drive is mounted.
+[`skills/redmount/`](skills/redmount/SKILL.md) is an [Agent Skill](https://agentskills.io/) that teaches AI agents the rules above. This repository is also a plugin and a plugin marketplace that ship it:
+
+- Claude Code: `/plugin marketplace add kaitoy/redmount`, then `/plugin install redmount@redmount`
+- GitHub Copilot CLI: `copilot plugin install kaitoy/redmount`
+- VS Code: run **Chat: Install Plugin from Source** and enter `https://github.com/kaitoy/redmount`
+- Other agents: copy `skills/redmount/` to the agent's skills directory
+
+Then tell the agent where the drive is mounted.
 
 ## License
 
