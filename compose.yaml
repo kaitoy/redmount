@@ -1,0 +1,14 @@
+services:
+  redmine:
+    image: redmine:6
+    ports:
+      - "8080:3000"
+    volumes:
+      - ./dev/redmine-init.rb:/redmine-init.rb:ro
+      - redmine-sqlite:/usr/src/redmine/sqlite
+      - redmine-files:/usr/src/redmine/files
+    # ponytail: runs the image's entrypoint twice (init via rails runner, then the server; the second migrate is a no-op). Revisit if the image's entrypoint changes.
+    entrypoint: ["sh", "-c", "/docker-entrypoint.sh rails runner /redmine-init.rb && exec /docker-entrypoint.sh rails server -b 0.0.0.0"]
+volumes:
+  redmine-sqlite:
+  redmine-files:
