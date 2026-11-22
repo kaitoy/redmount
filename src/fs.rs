@@ -478,8 +478,13 @@ impl RedmineFs {
     }
 
     /// Sends a dirty buffer to Redmine. On failure the buffer stays dirty and `<name>.error.txt` explains why.
+    /// An empty buffer stays dirty unsent: it is a truncate-then-write save in progress (PowerShell's
+    /// Set-Content closes the truncating handle first), and sending it would create an issue named
+    /// after the folder or blank out a comment.
     fn commit(&self, st: &mut State, node: Node, path: &str, key: &str) {
-        let Some(e) = st.local.get(key) else { return };
+        let Some(e) = st.local.get(key).filter(|e| !e.data.is_empty()) else {
+            return;
+        };
         let (data, name) = (e.data.clone(), e.name.clone());
         let err_key = format!("{key}.error.txt");
         match self.send(st, node, path, &name, data) {
@@ -984,6 +989,7 @@ fn ft(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redmine::IdName;
 
     #[test]
     fn names_and_times() {
@@ -1039,6 +1045,31 @@ mod tests {
         );
         assert_eq!(l.issues.keys().copied().collect::<Vec<_>>(), vec![3]);
         assert_eq!(l.cursor, "2026-01-05T00:00:00Z");
+    }
+
+    /// PowerShell's Set-Content truncates in one handle and writes in the next; the empty
+    /// intermediate state must not be sent (it would create an issue named after the folder).
+    #[test]
+    fn empty_buffer_is_not_sent() {
+        // nothing listens here, so any send attempt leaves an .error.txt
+        let api = Api::new("http://127.0.0.1:9", "k").unwrap();
+        let meta = Meta {
+            trackers: vec![IdName {
+                id: 1,
+                name: "Bug".into(),
+            }],
+            ..Default::default()
+        };
+        let fs = RedmineFs::new(api, meta, String::new());
+        fs.create("\\Bug\\new", true).unwrap();
+        fs.close("\\Bug\\new");
+        let md = "\\Bug\\new\\issue.md";
+        fs.open(md).unwrap();
+        fs.set_size(md, 0, true).unwrap();
+        fs.cleanup(md, false);
+        fs.close(md);
+        assert!(fs.stat("\\Bug\\new\\issue.md.error.txt").is_err());
+        assert_eq!(fs.stat(md).unwrap().size, 0);
     }
 
     #[test]
