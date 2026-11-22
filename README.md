@@ -22,6 +22,8 @@ cargo run --release -- --url https://redmine.example.com --project myproj --moun
 ```
 Press Enter to unmount. If the process died, unmount with `fusermount -u ~/redmine` (Linux) or `umount ~/redmine` (macOS).
 
+`--filter "assigned_to_id=me&fixed_version_id=3"` limits the folder listings to issues matching a Redmine `/issues.json` query string (`tracker_id`, `status_id` and `query_id` are not usable). Issues outside the filter are still reachable by typing their path, and one that stops matching leaves the listing within 10 minutes.
+
 The examples below use Windows paths; on Linux/macOS they are `~/redmine/Bug/123 Login fails/issue.md` and so on.
 
 ## Layout

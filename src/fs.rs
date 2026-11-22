@@ -143,13 +143,15 @@ pub struct RedmineFs {
     api: Api,
     meta: Meta,
     started: u64,
+    /// `--filter` query string, put before ours so our `tracker_id` / `status_id` win
+    filter: String,
     // ponytail: one global lock, held across HTTP calls; per-path locks if it gets sluggish
     st: Mutex<State>,
 }
 
 impl RedmineFs {
-    pub fn new(api: Api, meta: Meta) -> Self {
-        Self { api, meta, started: now(), st: Mutex::default() }
+    pub fn new(api: Api, meta: Meta, filter: String) -> Self {
+        Self { api, meta, started: now(), filter, st: Mutex::default() }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -177,14 +179,17 @@ impl RedmineFs {
         match st.lists.get_mut(&key) {
             Some(l) if l.checked.is_some_and(|t| t.elapsed() < TTL) => {}
             // the cursor is the newest updated_on in this list, so nothing edited after the fetch is missed
+            // ponytail: a filtered delta can't report issues that stopped matching `--filter`; they linger
+            // until the next full fetch (FULL). Diff against an unfiltered delta if that matters.
             Some(l) if l.full.elapsed() < FULL && !l.cursor.is_empty() => {
-                let changed = self.api.issues(pid, &format!("status_id=*&updated_on=%3E%3D{}", l.cursor)).map_err(io)?;
+                let q = format!("{}&status_id=*&updated_on=%3E%3D{}", self.filter, l.cursor);
+                let changed = self.api.issues(pid, &q).map_err(io)?;
                 l.merge(changed, tracker, |i| self.meta.closed_statuses.contains(&i.status.id) == closed);
                 l.checked = Some(Instant::now());
             }
             _ => {
                 let status = if closed { "closed" } else { "open" };
-                let v = self.api.issues(pid, &format!("tracker_id={tracker}&status_id={status}")).map_err(io)?;
+                let v = self.api.issues(pid, &format!("{}&tracker_id={tracker}&status_id={status}", self.filter)).map_err(io)?;
                 let now = Instant::now();
                 let mut l = List { checked: Some(now), full: now, cursor: String::new(), issues: BTreeMap::new() };
                 l.merge(v, tracker, |_| true);
