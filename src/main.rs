@@ -1,3 +1,23 @@
+/// One line on stdout with the UTC time. Unlike `println!`, a closed stdout (broken pipe) doesn't panic:
+/// this runs inside filesystem callbacks.
+macro_rules! log {
+    ($($t:tt)*) => {{
+        use std::io::Write;
+        let s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            % 86_400;
+        let _ = writeln!(
+            std::io::stdout(),
+            "{:02}:{:02}:{:02}Z {}",
+            s / 3600,
+            s / 60 % 60,
+            s % 60,
+            format_args!($($t)*)
+        );
+    }};
+}
+
 mod fs;
 #[cfg(unix)]
 mod fuse;
@@ -34,10 +54,13 @@ fn main() -> anyhow::Result<()> {
     let api = redmine::Api::new(&args.url, &key)?;
     let meta = api.meta(&args.project)?;
     let trackers: Vec<_> = meta.trackers.iter().map(|t| t.name.as_str()).collect();
-    println!(
-        "project #{} trackers: {}",
+    log!(
+        "project #{} trackers: {} ({} users, {} statuses, {} versions)",
         meta.project_id,
-        trackers.join(", ")
+        trackers.join(", "),
+        meta.users.len(),
+        meta.statuses.len(),
+        meta.versions.len()
     );
     let fs = fs::RedmineFs::new(api, meta, args.filter.trim_matches('&').to_string());
     #[cfg(windows)]

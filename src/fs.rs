@@ -120,17 +120,32 @@ struct List {
 
 impl List {
     /// Applies a project-wide delta: changed issues go in or out depending on tracker / status.
-    fn merge(&mut self, changed: Vec<Issue>, tracker: u64, keep: impl Fn(&Issue) -> bool) {
+    /// Returns the ones that changed this list; a delta always repeats the issue at the cursor.
+    fn merge(
+        &mut self,
+        changed: Vec<Issue>,
+        tracker: u64,
+        keep: impl Fn(&Issue) -> bool,
+    ) -> Vec<u64> {
+        let mut ids = Vec::new();
         for i in changed {
             if i.updated_on > self.cursor {
                 self.cursor = i.updated_on.clone();
             }
             if i.tracker.id == tracker && keep(&i) {
-                self.issues.insert(i.id, i);
-            } else {
-                self.issues.remove(&i.id);
+                let (id, updated) = (i.id, i.updated_on.clone());
+                if self
+                    .issues
+                    .insert(id, i)
+                    .is_none_or(|old| old.updated_on != updated)
+                {
+                    ids.push(id);
+                }
+            } else if self.issues.remove(&i.id).is_some() {
+                ids.push(i.id);
             }
         }
+        ids
     }
 }
 
@@ -187,8 +202,17 @@ impl RedmineFs {
             return Ok(i.clone());
         }
         let i = self.api.issue(id).map_err(io)?;
+        match &i {
+            Some(_) => log!("fetched #{id}"),
+            None => log!("#{id} not found"),
+        }
         st.issues.insert(id, (Instant::now(), i.clone()));
         Ok(i)
+    }
+
+    fn tracker_name(&self, id: u64) -> &str {
+        let t = self.meta.trackers.iter().find(|t| t.id == id);
+        t.map_or("?", |t| t.name.as_str())
     }
 
     fn must_issue(&self, st: &mut State, id: u64) -> Res<Issue> {
@@ -198,6 +222,7 @@ impl RedmineFs {
     fn list(&self, st: &mut State, tracker: u64, closed: bool) -> Res<Vec<Issue>> {
         let key = (tracker, closed);
         let pid = self.meta.project_id;
+        let status = if closed { "closed" } else { "open" };
         match st.lists.get_mut(&key) {
             Some(l) if l.checked.is_some_and(|t| t.elapsed() < TTL) => {}
             // the cursor is the newest updated_on in this list, so nothing edited after the fetch is missed
@@ -206,13 +231,21 @@ impl RedmineFs {
             Some(l) if l.full.elapsed() < FULL && !l.cursor.is_empty() => {
                 let q = format!("{}&status_id=*&updated_on=%3E%3D{}", self.filter, l.cursor);
                 let changed = self.api.issues(pid, &q).map_err(io)?;
-                l.merge(changed, tracker, |i| {
+                let ids = l.merge(changed, tracker, |i| {
                     self.meta.closed_statuses.contains(&i.status.id) == closed
                 });
+                if !ids.is_empty() {
+                    let list: Vec<_> = ids.iter().map(|i| format!("#{i}")).collect();
+                    log!(
+                        "{} ({status}): {} changed: {}",
+                        self.tracker_name(tracker),
+                        ids.len(),
+                        list.join(", ")
+                    );
+                }
                 l.checked = Some(Instant::now());
             }
             _ => {
-                let status = if closed { "closed" } else { "open" };
                 let v = self
                     .api
                     .issues(
@@ -220,6 +253,11 @@ impl RedmineFs {
                         &format!("{}&tracker_id={tracker}&status_id={status}", self.filter),
                     )
                     .map_err(io)?;
+                log!(
+                    "fetched {} {status} issues of {}",
+                    v.len(),
+                    self.tracker_name(tracker)
+                );
                 let now = Instant::now();
                 let mut l = List {
                     checked: Some(now),
@@ -247,6 +285,11 @@ impl RedmineFs {
             let i = self.must_issue(st, id)?;
             let a = i.attachments.iter().find(|a| a.id == att).ok_or_else(nf)?;
             let data = self.api.download(&a.content_url).map_err(io)?;
+            log!(
+                "downloaded {:?} ({} bytes) from #{id}",
+                a.filename,
+                data.len()
+            );
             st.blobs.insert(att, data);
         }
         Ok(())
@@ -546,12 +589,16 @@ impl RedmineFs {
                     );
                 }
                 let body = p.payload.diff(Some(&markdown::payload_of(&cur)));
-                if !body.is_empty() {
+                if body.is_empty() {
+                    log!("#{id}: no changes");
+                } else {
+                    let fields = body.keys().cloned().collect::<Vec<_>>().join(", ");
                     self.api.send(
                         Method::PUT,
                         &format!("/issues/{id}.json"),
                         Some(json!({ "issue": body })),
                     )?;
+                    log!("updated #{id}: {fields}");
                 }
                 Ok(Done::Updated(id))
             }
@@ -562,6 +609,7 @@ impl RedmineFs {
                     &format!("/journals/{j}.json"),
                     Some(json!({ "journal": { "notes": notes } })),
                 )?;
+                log!("updated comment_{j} of #{id}");
                 Ok(Done::Updated(id))
             }
             Node::Local => {
@@ -592,6 +640,11 @@ impl RedmineFs {
                             Some(json!({ "issue": body })),
                         )?;
                         let id = v["issue"]["id"].as_u64().context("No id in response")?;
+                        let subject = v["issue"]["subject"].as_str().unwrap_or_default();
+                        log!(
+                            "created #{id} {subject:?} in {}",
+                            self.tracker_name(tracker)
+                        );
                         Ok(Done::Created(id, pkey))
                     }
                     Node::IssueDir(id) if is_new_comment(name) => {
@@ -604,6 +657,7 @@ impl RedmineFs {
                             &format!("/issues/{id}.json"),
                             Some(json!({ "issue": { "notes": notes } })),
                         )?;
+                        log!("added a comment to #{id}");
                         Ok(Done::Consumed(id))
                     }
                     Node::AttachDir(id) if !data.is_empty() => {
@@ -611,6 +665,7 @@ impl RedmineFs {
                         let up = json!({ "issue": { "uploads": [{ "token": token, "filename": name }] } });
                         self.api
                             .send(Method::PUT, &format!("/issues/{id}.json"), Some(up))?;
+                        log!("attached {name:?} to #{id}");
                         Ok(Done::Consumed(id))
                     }
                     _ => Ok(Done::Nothing),
@@ -1032,8 +1087,13 @@ mod tests {
             |_| true,
         );
         assert_eq!(l.cursor, "2026-01-03T00:00:00Z");
+        // the issue at the cursor comes back unchanged
+        assert!(
+            l.merge(vec![issue(2, 1, 1, "2026-01-03T00:00:00Z")], 1, open)
+                .is_empty()
+        );
         // 1 closed, 2 moved to another tracker, 3 new, 4 belongs elsewhere
-        l.merge(
+        let ids = l.merge(
             vec![
                 issue(1, 1, 5, "2026-01-04T00:00:00Z"),
                 issue(2, 2, 1, "2026-01-05T00:00:00Z"),
@@ -1043,6 +1103,7 @@ mod tests {
             1,
             open,
         );
+        assert_eq!(ids, vec![1, 2, 3]);
         assert_eq!(l.issues.keys().copied().collect::<Vec<_>>(), vec![3]);
         assert_eq!(l.cursor, "2026-01-05T00:00:00Z");
     }
