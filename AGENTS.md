@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents when working with code in this repository.
 
 redmount mounts one Redmine project as a Windows drive via WinFsp, or as a directory via FUSE on Linux (fuser, pure-Rust mount via fusermount) and macOS (macFUSE) (Rust, edition 2024). See README.md for the user-facing file layout and write semantics.
 
