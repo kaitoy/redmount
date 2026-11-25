@@ -1,7 +1,8 @@
-//! OS-neutral filesystem core: `\<tracker>\<id subject>\{issue.md, comment_<journal>.md, attachments\*}`.
+//! OS-neutral filesystem core: `\<tracker>\<id subject>\{issue.md, comment_<journal>.md, attachments\*}`
+//! and `\_wiki\<page title>\{page.md, attachments\*}`.
 //! Paths always use `\`; `win.rs` (WinFsp) and `fuse.rs` (FUSE) adapt it to the OS.
 use crate::markdown;
-use crate::redmine::{Api, Attachment, Issue, Journal, Meta};
+use crate::redmine::{Api, Attachment, Issue, Journal, Meta, WikiIndexEntry, WikiPage};
 use anyhow::{Context, anyhow, bail};
 use reqwest::Method;
 use serde_json::json;
@@ -15,6 +16,8 @@ const TTL: Duration = Duration::from_secs(30);
 const FULL: Duration = Duration::from_secs(600);
 /// Folder in each tracker folder listing its closed issues (the tracker folder itself lists open ones).
 const CLOSED: &str = "_closed";
+/// Top-level folder listing project wiki pages (when the wiki module is enabled).
+const WIKI: &str = "_wiki";
 /// 1601-01-01 -> 1970-01-01 in 100ns (times are FILETIME units)
 pub const EPOCH: u64 = 116_444_736_000_000_000;
 
@@ -49,7 +52,7 @@ pub struct Stat {
     pub modified: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Node {
     Root,
     Tracker(u64),
@@ -62,13 +65,21 @@ enum Node {
     Comment(u64, u64),
     AttachDir(u64),
     Attachment(u64, u64),
+    /// `\_wiki`
+    WikiRoot,
+    WikiDir(String),
+    /// Folder made in `_wiki`; becomes a wiki page when its page.md is saved.
+    WikiPending,
+    WikiMd(String),
+    WikiAttachDir(String),
+    WikiAttachment(String, u64),
     /// Only exists in memory (new / scratch / error files).
     Local,
 }
 
 impl Node {
     #[cfg(windows)]
-    fn is_dir(self) -> bool {
+    fn is_dir(&self) -> bool {
         matches!(
             self,
             Node::Root
@@ -77,6 +88,10 @@ impl Node {
                 | Node::IssueDir(_)
                 | Node::Pending(_)
                 | Node::AttachDir(_)
+                | Node::WikiRoot
+                | Node::WikiDir(_)
+                | Node::WikiPending
+                | Node::WikiAttachDir(_)
         )
     }
 }
@@ -149,12 +164,24 @@ impl List {
     }
 }
 
-/// `local` keys: `#<id>\<lowercased rest>` under issues, `\<tracker>\<pending>\...` for pending folders.
+/// Cached wiki page list (`GET /projects/:id/wiki/index.json`).
+struct WikiList {
+    checked: Option<Instant>,
+    pages: Vec<WikiIndexEntry>,
+}
+
+/// `local` keys: `#<id>\<lowercased rest>` under issues, `wiki:<title>\<lowercased rest>` under wiki pages,
+/// `\<tracker>\<pending>\...` and `\_wiki\<pending>\...` for pending folders.
 #[derive(Default)]
 struct State {
     issues: HashMap<u64, (Instant, Option<Issue>)>,
     /// (tracker id, closed)
     lists: HashMap<(u64, bool), List>,
+    wiki_list: Option<WikiList>,
+    /// lowercased title -> cached page
+    wiki_pages: HashMap<String, (Instant, Option<WikiPage>)>,
+    /// pending wiki folder key -> actual Redmine title created from it
+    wiki_aliases: HashMap<String, String>,
     // ponytail: attachment bodies cached until unmount
     blobs: HashMap<u64, Vec<u8>>,
     local: BTreeMap<String, Entry>,
@@ -167,6 +194,9 @@ enum Done {
     /// The local file became server data (new note / upload) and goes away.
     Consumed(u64),
     Created(u64, String),
+    WikiUpdated(String),
+    WikiConsumed(String),
+    WikiCreated(String, String),
     Nothing,
 }
 
@@ -295,6 +325,70 @@ impl RedmineFs {
         Ok(())
     }
 
+    fn wiki_list(&self, st: &mut State) -> Res<Vec<WikiIndexEntry>> {
+        let fresh = st
+            .wiki_list
+            .as_ref()
+            .is_some_and(|l| l.checked.is_some_and(|t| t.elapsed() < TTL));
+        if !fresh {
+            let pages = self.api.wiki_index(self.meta.project_id).map_err(io)?;
+            log!("fetched {} wiki pages", pages.len());
+            st.wiki_list = Some(WikiList {
+                checked: Some(Instant::now()),
+                pages,
+            });
+        }
+        Ok(st
+            .wiki_list
+            .as_ref()
+            .map_or_else(Vec::new, |l| l.pages.clone()))
+    }
+
+    fn wiki_page(&self, st: &mut State, title: &str) -> Res<Option<WikiPage>> {
+        let key = title.to_lowercase();
+        if let Some((t, p)) = st.wiki_pages.get(&key)
+            && t.elapsed() < TTL
+        {
+            return Ok(p.clone());
+        }
+        let p = self
+            .api
+            .wiki_page(self.meta.project_id, title)
+            .map_err(io)?;
+        match &p {
+            Some(_) => log!("fetched wiki/{title}"),
+            None => log!("wiki/{title} not found"),
+        }
+        st.wiki_pages.insert(key, (Instant::now(), p.clone()));
+        Ok(p)
+    }
+
+    fn must_wiki_page(&self, st: &mut State, title: &str) -> Res<WikiPage> {
+        self.wiki_page(st, title)?.ok_or_else(nf)
+    }
+
+    fn invalidate_wiki(&self, st: &mut State, title: &str) {
+        st.wiki_pages.remove(&title.to_lowercase());
+        if let Some(l) = st.wiki_list.as_mut() {
+            l.checked = None;
+        }
+    }
+
+    fn wiki_blob(&self, st: &mut State, title: &str, att: u64) -> Res<()> {
+        if !st.blobs.contains_key(&att) {
+            let p = self.must_wiki_page(st, title)?;
+            let a = p.attachments.iter().find(|a| a.id == att).ok_or_else(nf)?;
+            let data = self.api.download(&a.content_url).map_err(io)?;
+            log!(
+                "downloaded {:?} ({} bytes) from wiki/{title}",
+                a.filename,
+                data.len()
+            );
+            st.blobs.insert(att, data);
+        }
+        Ok(())
+    }
+
     /// Path -> node + overlay key. `None` = doesn't exist.
     fn resolve(&self, st: &mut State, path: &str) -> Res<Option<(Node, String)>> {
         let mut c: Vec<String> = path
@@ -305,6 +399,59 @@ impl RedmineFs {
         let Some(first) = c.first() else {
             return Ok(Some((Node::Root, String::new())));
         };
+        let local =
+            |st: &State, key: String| st.local.contains_key(&key).then_some((Node::Local, key));
+        if *first == WIKI {
+            if !self.meta.wiki_enabled {
+                return Ok(None);
+            }
+            let rkey = format!("\\{WIKI}");
+            if c.len() == 1 {
+                return Ok(Some((Node::WikiRoot, rkey)));
+            }
+            let pkey = format!("{rkey}\\{}", c[1]);
+            if st.local.contains_key(&pkey) {
+                if c.len() == 2 {
+                    return Ok(Some((Node::WikiPending, pkey)));
+                }
+                return Ok(local(st, format!("{pkey}\\{}", c[2..].join("\\"))));
+            }
+            let title = match st.wiki_aliases.get(&pkey).cloned() {
+                Some(t) => t,
+                None => {
+                    // ponytail: assumes sanitized titles are unique (case-insensitively) within a project
+                    let Some(entry) = self
+                        .wiki_list(st)?
+                        .into_iter()
+                        .find(|p| sanitize(&p.title, 100).to_lowercase() == c[1])
+                    else {
+                        return Ok(None);
+                    };
+                    entry.title
+                }
+            };
+            let wkey = format!("wiki:{}", title.to_lowercase());
+            if c.len() == 2 {
+                return Ok(Some((Node::WikiDir(title), wkey)));
+            }
+            let Some(page) = self.wiki_page(st, &title)? else {
+                return Ok(None);
+            };
+            let key = format!("{wkey}\\{}", c[2..].join("\\"));
+            let node = match (c.len(), c[2].as_str()) {
+                (3, "page.md") => Some(Node::WikiMd(title)),
+                (3, "attachments") => Some(Node::WikiAttachDir(title)),
+                (4, "attachments") => att_names(&page.attachments)
+                    .into_iter()
+                    .find(|(n, _)| n.to_lowercase() == c[3])
+                    .map(|(_, a)| Node::WikiAttachment(title, a.id)),
+                _ => None,
+            };
+            return Ok(match node {
+                Some(n) => Some((n, key)),
+                None => local(st, key),
+            });
+        }
         let Some(t) = self
             .meta
             .trackers
@@ -325,8 +472,6 @@ impl RedmineFs {
             }
             c.remove(1);
         }
-        let local =
-            |st: &State, key: String| st.local.contains_key(&key).then_some((Node::Local, key));
         let pkey = format!("{tkey}\\{}", c[1]);
         if !closed && st.local.contains_key(&pkey) {
             if c.len() == 2 {
@@ -355,7 +500,7 @@ impl RedmineFs {
             (3, name) => comment_id(name)
                 .filter(|j| issue.journals.iter().any(|x| x.id == *j && has_notes(x)))
                 .map(|j| Node::Comment(id, j)),
-            (4, "attachments") => att_names(&issue)
+            (4, "attachments") => att_names(&issue.attachments)
                 .into_iter()
                 .find(|(n, _)| n.to_lowercase() == c[3])
                 .map(|(_, a)| Node::Attachment(id, a.id)),
@@ -371,71 +516,102 @@ impl RedmineFs {
         self.resolve(st, path)?.ok_or_else(nf)
     }
 
-    fn render(&self, st: &mut State, node: Node) -> Res<Vec<u8>> {
+    fn render(&self, st: &mut State, node: &Node) -> Res<Vec<u8>> {
         Ok(match node {
             Node::IssueMd(id) => {
-                markdown::render_issue(&self.must_issue(st, id)?, &self.meta).into_bytes()
+                markdown::render_issue(&self.must_issue(st, *id)?, &self.meta).into_bytes()
             }
             Node::Comment(id, j) => {
-                let i = self.must_issue(st, id)?;
-                markdown::render_comment(i.journals.iter().find(|x| x.id == j).ok_or_else(nf)?)
+                let i = self.must_issue(st, *id)?;
+                markdown::render_comment(i.journals.iter().find(|x| x.id == *j).ok_or_else(nf)?)
                     .into_bytes()
+            }
+            Node::WikiMd(title) => {
+                markdown::render_wiki(&self.must_wiki_page(st, title)?).into_bytes()
             }
             _ => Vec::new(),
         })
     }
 
-    fn info(&self, st: &mut State, node: Node, key: &str) -> Res<Stat> {
+    fn info(&self, st: &mut State, node: &Node, key: &str) -> Res<Stat> {
         if let Some(e) = st.local.get(key) {
             return Ok(finfo(e.dir, e.data.len() as u64, e.time, e.time));
         }
         Ok(match node {
-            Node::Root | Node::Tracker(_) | Node::Closed(_) => {
+            Node::Root | Node::Tracker(_) | Node::Closed(_) | Node::WikiRoot => {
                 finfo(true, 0, self.started, self.started)
             }
             Node::IssueDir(id) | Node::AttachDir(id) => {
-                let i = self.must_issue(st, id)?;
+                let i = self.must_issue(st, *id)?;
                 finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))
             }
             Node::IssueMd(id) => {
                 let len = self.render(st, node)?.len() as u64;
-                let i = self.must_issue(st, id)?;
+                let i = self.must_issue(st, *id)?;
                 finfo(false, len, ft(&i.created_on), ft(&i.updated_on))
             }
             Node::Comment(id, j) => {
                 let len = self.render(st, node)?.len() as u64;
-                let i = self.must_issue(st, id)?;
+                let i = self.must_issue(st, *id)?;
                 let t = i
                     .journals
                     .iter()
-                    .find(|x| x.id == j)
+                    .find(|x| x.id == *j)
                     .map_or(EPOCH, |x| ft(&x.created_on));
                 finfo(false, len, t, t)
             }
             Node::Attachment(id, att) => {
-                let i = self.must_issue(st, id)?;
-                let a = i.attachments.iter().find(|a| a.id == att).ok_or_else(nf)?;
+                let i = self.must_issue(st, *id)?;
+                let a = i.attachments.iter().find(|a| a.id == *att).ok_or_else(nf)?;
                 let t = ft(&a.created_on);
                 finfo(false, a.filesize, t, t)
             }
-            Node::Pending(_) | Node::Local => return Err(nf()),
+            Node::WikiDir(title) | Node::WikiAttachDir(title) => {
+                if let Some(p) = st
+                    .wiki_list
+                    .as_ref()
+                    .and_then(|l| l.pages.iter().find(|p| p.title.eq_ignore_ascii_case(title)))
+                {
+                    finfo(true, 0, ft(&p.created_on), ft(&p.updated_on))
+                } else {
+                    let p = self.must_wiki_page(st, title)?;
+                    finfo(true, 0, ft(&p.created_on), ft(&p.updated_on))
+                }
+            }
+            Node::WikiMd(title) => {
+                let len = self.render(st, node)?.len() as u64;
+                let p = self.must_wiki_page(st, title)?;
+                finfo(false, len, ft(&p.created_on), ft(&p.updated_on))
+            }
+            Node::WikiAttachment(title, att) => {
+                let p = self.must_wiki_page(st, title)?;
+                let a = p.attachments.iter().find(|a| a.id == *att).ok_or_else(nf)?;
+                let t = ft(&a.created_on);
+                finfo(false, a.filesize, t, t)
+            }
+            Node::Pending(_) | Node::WikiPending | Node::Local => return Err(nf()),
         })
     }
 
-    fn list_dir(&self, st: &mut State, node: Node, key: &str) -> Res<Vec<(String, Stat)>> {
+    fn list_dir(&self, st: &mut State, node: &Node, key: &str) -> Res<Vec<(String, Stat)>> {
         let mut out: Vec<(String, Stat)> = match node {
             Node::Root => {
                 let fi = finfo(true, 0, self.started, self.started);
-                self.meta
+                let mut v: Vec<_> = self
+                    .meta
                     .trackers
                     .iter()
                     .map(|t| (sanitize(&t.name, 100), fi))
-                    .collect()
+                    .collect();
+                if self.meta.wiki_enabled {
+                    v.push((WIKI.to_string(), fi));
+                }
+                v
             }
             Node::Tracker(tid) | Node::Closed(tid) => {
                 let closed = matches!(node, Node::Closed(_));
                 let mut v: Vec<_> = self
-                    .list(st, tid, closed)?
+                    .list(st, *tid, closed)?
                     .iter()
                     .map(|i| {
                         (
@@ -453,29 +629,30 @@ impl RedmineFs {
                 v
             }
             Node::IssueDir(id) => {
+                let id = *id;
                 let i = self.must_issue(st, id)?;
                 let mut v = vec![
                     (
                         "issue.md".to_string(),
-                        self.info(st, Node::IssueMd(id), &format!("#{id}\\issue.md"))?,
+                        self.info(st, &Node::IssueMd(id), &format!("#{id}\\issue.md"))?,
                     ),
                     (
                         "attachments".to_string(),
-                        self.info(st, Node::AttachDir(id), "")?,
+                        self.info(st, &Node::AttachDir(id), "")?,
                     ),
                 ];
                 for j in i.journals.iter().filter(|j| has_notes(j)) {
                     let name = format!("comment_{}.md", j.id);
                     v.push((
                         name.clone(),
-                        self.info(st, Node::Comment(id, j.id), &format!("#{id}\\{name}"))?,
+                        self.info(st, &Node::Comment(id, j.id), &format!("#{id}\\{name}"))?,
                     ));
                 }
                 v
             }
             Node::AttachDir(id) => {
-                let i = self.must_issue(st, id)?;
-                att_names(&i)
+                let i = self.must_issue(st, *id)?;
+                att_names(&i.attachments)
                     .into_iter()
                     .map(|(n, a)| {
                         let t = ft(&a.created_on);
@@ -483,7 +660,45 @@ impl RedmineFs {
                     })
                     .collect()
             }
-            Node::Pending(_) => Vec::new(),
+            Node::WikiRoot => self
+                .wiki_list(st)?
+                .iter()
+                .map(|p| {
+                    (
+                        sanitize(&p.title, 100),
+                        finfo(true, 0, ft(&p.created_on), ft(&p.updated_on)),
+                    )
+                })
+                .collect(),
+            Node::WikiDir(title) => {
+                self.must_wiki_page(st, title)?;
+                let wkey = format!("wiki:{}", title.to_lowercase());
+                vec![
+                    (
+                        "page.md".to_string(),
+                        self.info(
+                            st,
+                            &Node::WikiMd(title.clone()),
+                            &format!("{wkey}\\page.md"),
+                        )?,
+                    ),
+                    (
+                        "attachments".to_string(),
+                        self.info(st, &Node::WikiAttachDir(title.clone()), "")?,
+                    ),
+                ]
+            }
+            Node::WikiAttachDir(title) => {
+                let p = self.must_wiki_page(st, title)?;
+                att_names(&p.attachments)
+                    .into_iter()
+                    .map(|(n, a)| {
+                        let t = ft(&a.created_on);
+                        (n, finfo(false, a.filesize, t, t))
+                    })
+                    .collect()
+            }
+            Node::Pending(_) | Node::WikiPending => Vec::new(),
             _ => return Err(E::NotDir),
         };
         for (name, fi) in local_children(st, key) {
@@ -498,23 +713,25 @@ impl RedmineFs {
         Ok(out)
     }
 
-    /// Writable buffer for a file (creates the edit buffer of issue.md / comments on demand).
+    /// Writable buffer for a file (creates the edit buffer of issue.md / comments / page.md on demand).
     fn entry<'a>(
         &self,
         st: &'a mut State,
-        node: Node,
+        node: &Node,
         key: &str,
         path: &str,
     ) -> Res<&'a mut Entry> {
         match node {
-            Node::IssueMd(_) | Node::Comment(..) if !st.local.contains_key(key) => {
+            Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_)
+                if !st.local.contains_key(key) =>
+            {
                 let data = self.render(st, node)?;
                 st.local.insert(
                     key.to_string(),
                     Entry::new(split_parent(path).1, false, data, true),
                 );
             }
-            Node::IssueMd(_) | Node::Comment(..) | Node::Local => {}
+            Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_) | Node::Local => {}
             _ => return Err(E::Denied),
         }
         st.local.get_mut(key).filter(|e| !e.dir).ok_or(E::Denied)
@@ -524,7 +741,7 @@ impl RedmineFs {
     /// An empty buffer stays dirty unsent: it is a truncate-then-write save in progress (PowerShell's
     /// Set-Content closes the truncating handle first), and sending it would create an issue named
     /// after the folder or blank out a comment.
-    fn commit(&self, st: &mut State, node: Node, path: &str, key: &str) {
+    fn commit(&self, st: &mut State, node: &Node, path: &str, key: &str) {
         let Some(e) = st.local.get(key).filter(|e| !e.data.is_empty()) else {
             return;
         };
@@ -553,6 +770,22 @@ impl RedmineFs {
                         st.aliases.insert(pkey, id);
                         self.invalidate(st, id);
                     }
+                    Done::WikiUpdated(title) => self.invalidate_wiki(st, &title),
+                    Done::WikiConsumed(title) => {
+                        self.invalidate_wiki(st, &title);
+                        let idle = st.local.get_mut(key).is_some_and(|e| {
+                            e.transient = true;
+                            e.opens == 0
+                        });
+                        if idle {
+                            st.local.remove(key);
+                        }
+                    }
+                    Done::WikiCreated(title, pkey) => {
+                        remove_tree(st, &pkey);
+                        st.wiki_aliases.insert(pkey, title.clone());
+                        self.invalidate_wiki(st, &title);
+                    }
                     Done::Nothing => {}
                 }
             }
@@ -572,13 +805,14 @@ impl RedmineFs {
     fn send(
         &self,
         st: &mut State,
-        node: Node,
+        node: &Node,
         path: &str,
         name: &str,
         data: Vec<u8>,
     ) -> anyhow::Result<Done> {
         match node {
             Node::IssueMd(id) => {
+                let id = *id;
                 let cur = self.api.issue(id)?.context("Issue not found")?;
                 let p = markdown::parse_issue(utf8(&data)?, &self.meta, Some(&cur))?;
                 if let Some(u) = p.updated_on.filter(|u| *u != cur.updated_on) {
@@ -603,6 +837,7 @@ impl RedmineFs {
                 Ok(Done::Updated(id))
             }
             Node::Comment(id, j) => {
+                let (id, j) = (*id, *j);
                 let notes = markdown::parse_comment(utf8(&data)?);
                 self.api.send(
                     Method::PUT,
@@ -611,6 +846,42 @@ impl RedmineFs {
                 )?;
                 log!("updated comment_{j} of #{id}");
                 Ok(Done::Updated(id))
+            }
+            Node::WikiMd(title) => {
+                let pid = self.meta.project_id;
+                let cur = self
+                    .api
+                    .wiki_page(pid, title)?
+                    .context("Wiki page not found")?;
+                let p = markdown::parse_wiki(utf8(&data)?)?;
+                if let Some(v) = p.version.filter(|v| *v != cur.version) {
+                    bail!(
+                        "Conflict: the wiki page was updated on the server while you were editing (version: {v} -> {now}).\r\n\
+                         To overwrite, change version to {now} and save; to discard your edits, delete page.md.",
+                        now = cur.version
+                    );
+                }
+                let text_changed = p.text != markdown::norm_text(&cur.text);
+                let cur_parent = cur.parent.as_ref().map_or("", |x| x.title.as_str());
+                let parent_changed = p.parent != cur_parent;
+                let has_comments = !p.comments.is_empty();
+                if !text_changed && !parent_changed && !has_comments {
+                    log!("wiki/{title}: no changes");
+                } else {
+                    let mut body = serde_json::Map::new();
+                    body.insert("text".into(), json!(p.text));
+                    body.insert("version".into(), json!(cur.version));
+                    if parent_changed {
+                        body.insert("parent_title".into(), json!(p.parent));
+                    }
+                    if has_comments {
+                        body.insert("comments".into(), json!(p.comments));
+                    }
+                    self.api
+                        .put_wiki_page(pid, title, json!({ "wiki_page": body }))?;
+                    log!("updated wiki/{title}");
+                }
+                Ok(Done::WikiUpdated(title.clone()))
             }
             Node::Local => {
                 let Some((parent, pkey)) = self
@@ -647,6 +918,33 @@ impl RedmineFs {
                         );
                         Ok(Done::Created(id, pkey))
                     }
+                    Node::WikiPending if lname == "page.md" => {
+                        let folder = st
+                            .local
+                            .get(&pkey)
+                            .map(|e| e.name.clone())
+                            .unwrap_or_default();
+                        let p = markdown::parse_wiki(utf8(&data)?)?;
+                        let mut body = serde_json::Map::new();
+                        body.insert("text".into(), json!(p.text));
+                        if !p.parent.is_empty() {
+                            body.insert("parent_title".into(), json!(p.parent));
+                        }
+                        if !p.comments.is_empty() {
+                            body.insert("comments".into(), json!(p.comments));
+                        }
+                        let v = self.api.put_wiki_page(
+                            self.meta.project_id,
+                            &folder,
+                            json!({ "wiki_page": body }),
+                        )?;
+                        let actual_title = v["wiki_page"]["title"]
+                            .as_str()
+                            .map(String::from)
+                            .unwrap_or(folder);
+                        log!("created wiki/{actual_title}");
+                        Ok(Done::WikiCreated(actual_title, pkey))
+                    }
                     Node::IssueDir(id) if is_new_comment(name) => {
                         let notes = markdown::parse_comment(utf8(&data)?);
                         if notes.is_empty() {
@@ -667,6 +965,24 @@ impl RedmineFs {
                             .send(Method::PUT, &format!("/issues/{id}.json"), Some(up))?;
                         log!("attached {name:?} to #{id}");
                         Ok(Done::Consumed(id))
+                    }
+                    Node::WikiAttachDir(title) if !data.is_empty() => {
+                        let pid = self.meta.project_id;
+                        let token = self.api.upload(name, data)?;
+                        let cur = self
+                            .api
+                            .wiki_page(pid, &title)?
+                            .context("Wiki page not found")?;
+                        let up = json!({
+                            "wiki_page": {
+                                "text": cur.text,
+                                "version": cur.version,
+                                "uploads": [{ "token": token, "filename": name }]
+                            }
+                        });
+                        self.api.put_wiki_page(pid, &title, up)?;
+                        log!("attached {name:?} to wiki/{title}");
+                        Ok(Done::WikiConsumed(title))
                     }
                     _ => Ok(Done::Nothing),
                 }
@@ -694,20 +1010,20 @@ impl RedmineFs {
     pub fn stat(&self, path: &str) -> Res<Stat> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
-        self.info(&mut st, node, &key)
+        self.info(&mut st, &node, &key)
     }
 
-    /// Counts a handle; issue.md / comments get a snapshot so the handle sees one consistent text.
+    /// Counts a handle; issue.md / comments / page.md get a snapshot so the handle sees one consistent text.
     pub fn open(&self, path: &str) -> Res<Stat> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
-        if matches!(node, Node::IssueMd(_) | Node::Comment(..)) {
-            self.entry(&mut st, node, &key, path)?;
+        if matches!(node, Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_)) {
+            self.entry(&mut st, &node, &key, path)?;
         }
         if let Some(e) = st.local.get_mut(&key) {
             e.opens += 1;
         }
-        self.info(&mut st, node, &key)
+        self.info(&mut st, &node, &key)
     }
 
     pub fn close(&self, path: &str) {
@@ -729,14 +1045,30 @@ impl RedmineFs {
         let (parent, name) = split_parent(path);
         let mut st = self.lock();
         let (pnode, pkey) = self.resolve(&mut st, parent)?.ok_or(E::PathNotFound)?;
-        match (pnode, dir) {
-            (Node::Tracker(_), true)
-            | (Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_), false) => {}
+        match (&pnode, dir) {
+            (Node::Tracker(_) | Node::WikiRoot, true)
+            | (
+                Node::IssueDir(_)
+                | Node::Pending(_)
+                | Node::AttachDir(_)
+                | Node::WikiDir(_)
+                | Node::WikiPending
+                | Node::WikiAttachDir(_),
+                false,
+            ) => {}
             _ => return Err(E::Denied),
         }
-        let key = format!("{pkey}\\{}", name.to_lowercase());
+        let lname = name.to_lowercase();
+        let key = format!("{pkey}\\{lname}");
         if st.local.contains_key(&key)
             || (matches!(pnode, Node::Tracker(_)) && name.eq_ignore_ascii_case(CLOSED))
+            || (matches!(pnode, Node::WikiRoot)
+                && (st.wiki_aliases.contains_key(&key)
+                    || st.wiki_list.as_ref().is_some_and(|l| {
+                        l.pages
+                            .iter()
+                            .any(|p| sanitize(&p.title, 100).to_lowercase() == lname)
+                    })))
         {
             return Err(E::Exists);
         }
@@ -744,13 +1076,17 @@ impl RedmineFs {
         e.opens = 1;
         st.local.insert(key.clone(), e);
         if dir {
-            let tpl = markdown::template(&self.meta).into_bytes();
+            let (fname, tpl) = if matches!(pnode, Node::WikiRoot) {
+                ("page.md", markdown::wiki_template().into_bytes())
+            } else {
+                ("issue.md", markdown::template(&self.meta).into_bytes())
+            };
             st.local.insert(
-                format!("{key}\\issue.md"),
-                Entry::new("issue.md", false, tpl, false),
+                format!("{key}\\{fname}"),
+                Entry::new(fname, false, tpl, false),
             );
         }
-        self.info(&mut st, Node::Local, &key)
+        self.info(&mut st, &Node::Local, &key)
     }
 
     /// A handle is done: delete the file (`check_delete` passed) or send its unsent edits.
@@ -762,7 +1098,7 @@ impl RedmineFs {
         if delete {
             Self::remove(&mut st, &key);
         } else if st.local.get(&key).is_some_and(|e| e.dirty) {
-            self.commit(&mut st, node, path, &key);
+            self.commit(&mut st, &node, path, &key);
         }
     }
 
@@ -771,10 +1107,12 @@ impl RedmineFs {
         let (node, key) = self.must_resolve(&mut st, path)?;
         match node {
             Node::Local => Ok(()),
-            Node::Pending(_) if local_children(&st, &key).is_empty() => Ok(()),
-            Node::Pending(_) => Err(E::NotEmpty),
+            Node::Pending(_) | Node::WikiPending if local_children(&st, &key).is_empty() => Ok(()),
+            Node::Pending(_) | Node::WikiPending => Err(E::NotEmpty),
             // only unsent edits can be "deleted" (= discarded)
-            Node::IssueMd(_) | Node::Comment(..) if st.local.get(&key).is_some_and(|e| e.dirty) => {
+            Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_)
+                if st.local.get(&key).is_some_and(|e| e.dirty) =>
+            {
                 Ok(())
             }
             _ => Err(E::Denied),
@@ -785,20 +1123,20 @@ impl RedmineFs {
     pub fn set_size(&self, path: &str, size: u64, alloc_only: bool) -> Res<Stat> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
-        let e = self.entry(&mut st, node, &key, path)?;
+        let e = self.entry(&mut st, &node, &key, path)?;
         let n = size as usize;
         if (!alloc_only || n < e.data.len()) && n != e.data.len() {
             e.data.resize(n, 0);
             e.dirty = true;
         }
-        self.info(&mut st, node, &key)
+        self.info(&mut st, &node, &key)
     }
 
     /// Sorted entries, without `.` / `..`.
     pub fn read_dir(&self, path: &str) -> Res<Vec<(String, Stat)>> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
-        self.list_dir(&mut st, node, &key)
+        self.list_dir(&mut st, &node, &key)
     }
 
     pub fn rename(&self, from: &str, to: &str, replace_if_exists: bool) -> Res<()> {
@@ -807,21 +1145,35 @@ impl RedmineFs {
         let (node, key) = self.must_resolve(&mut st, from)?;
         let (pnode, pkey) = self.resolve(&mut st, to_parent)?.ok_or(E::PathNotFound)?;
         let target = self.resolve(&mut st, to)?;
-        let new_key = match (node, pnode, &target) {
+        let new_key = match (&node, &pnode, &target) {
             // case-only rename
-            (Node::Local | Node::Pending(_), _, Some((_, k))) if *k == key => key.clone(),
+            (Node::Local | Node::Pending(_) | Node::WikiPending, _, Some((_, k))) if *k == key => {
+                key.clone()
+            }
             (Node::Pending(t), Node::Tracker(pt), None) if t == pt => {
                 format!("{pkey}\\{}", to_name.to_lowercase())
             }
-            (Node::Local, Node::IssueDir(_) | Node::Pending(_) | Node::AttachDir(_), None) => {
+            (Node::WikiPending, Node::WikiRoot, None) => {
                 format!("{pkey}\\{}", to_name.to_lowercase())
             }
-            // atomic save: temp file -> issue.md / comment
-            (Node::Local, _, Some((Node::Local | Node::IssueMd(_) | Node::Comment(..), k)))
-                if replace_if_exists =>
-            {
-                k.clone()
+            (
+                Node::Local,
+                Node::IssueDir(_)
+                | Node::Pending(_)
+                | Node::AttachDir(_)
+                | Node::WikiDir(_)
+                | Node::WikiPending
+                | Node::WikiAttachDir(_),
+                None,
+            ) => {
+                format!("{pkey}\\{}", to_name.to_lowercase())
             }
+            // atomic save: temp file -> issue.md / comment / page.md
+            (
+                Node::Local,
+                _,
+                Some((Node::Local | Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_), k)),
+            ) if replace_if_exists => k.clone(),
             (_, _, Some(_)) => return Err(E::Exists),
             _ => return Err(E::Denied),
         };
@@ -842,18 +1194,21 @@ impl RedmineFs {
             if k == key {
                 e.name = to_name.to_string();
                 e.opens += replaced_opens;
-                e.transient |= matches!(target, Some((Node::IssueMd(_) | Node::Comment(..), _)));
+                e.transient |= matches!(
+                    target,
+                    Some((Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_), _))
+                );
             }
             st.local.insert(format!("{new_key}{}", &k[key.len()..]), e);
         }
-        // A file landing on a meaningful name (issue.md, comment.md, attachments\) is sent right away.
+        // A file landing on a meaningful name (issue.md, comment.md, page.md, attachments\) is sent right away.
         if node == Node::Local
             && let Some(e) = st.local.get_mut(&new_key)
             && !e.data.is_empty()
         {
             e.dirty = true;
             let tnode = target.map_or(Node::Local, |(n, _)| n);
-            self.commit(&mut st, tnode, to, &new_key);
+            self.commit(&mut st, &tnode, to, &new_key);
         }
         Ok(())
     }
@@ -862,19 +1217,27 @@ impl RedmineFs {
     pub fn read(&self, path: &str, buffer: &mut [u8], offset: u64) -> Res<usize> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
-        let rendered = match node {
+        let rendered = match &node {
             _ if st.local.contains_key(&key) => None,
             Node::Attachment(id, att) => {
-                self.blob(&mut st, id, att)?;
+                self.blob(&mut st, *id, *att)?;
                 None
             }
-            Node::IssueMd(_) | Node::Comment(..) => Some(self.render(&mut st, node)?),
+            Node::WikiAttachment(title, att) => {
+                self.wiki_blob(&mut st, title, *att)?;
+                None
+            }
+            Node::IssueMd(_) | Node::Comment(..) | Node::WikiMd(_) => {
+                Some(self.render(&mut st, &node)?)
+            }
             _ => None,
         };
-        let data: &[u8] = match (&rendered, st.local.get(&key), node) {
+        let data: &[u8] = match (&rendered, st.local.get(&key), &node) {
             (Some(r), _, _) => r.as_slice(),
             (None, Some(e), _) => e.data.as_slice(),
-            (None, None, Node::Attachment(_, att)) => st.blobs[&att].as_slice(),
+            (None, None, Node::Attachment(_, att) | Node::WikiAttachment(_, att)) => {
+                st.blobs[att].as_slice()
+            }
             _ => &[],
         };
         let off = (offset as usize).min(data.len());
@@ -894,7 +1257,7 @@ impl RedmineFs {
     ) -> Res<(usize, Stat)> {
         let mut st = self.lock();
         let (node, key) = self.must_resolve(&mut st, path)?;
-        let e = self.entry(&mut st, node, &key, path)?;
+        let e = self.entry(&mut st, &node, &key, path)?;
         let off = if to_eof {
             e.data.len()
         } else {
@@ -912,7 +1275,7 @@ impl RedmineFs {
             e.data[off..off + len].copy_from_slice(&buffer[..len]);
             e.dirty = true;
         }
-        Ok((len, self.info(&mut st, node, &key)?))
+        Ok((len, self.info(&mut st, &node, &key)?))
     }
 }
 
@@ -986,12 +1349,10 @@ fn is_new_comment(name: &str) -> bool {
 }
 
 /// Attachment file names; duplicates get an `<id>_` prefix.
-fn att_names(i: &Issue) -> Vec<(String, &Attachment)> {
-    i.attachments
-        .iter()
+fn att_names(atts: &[Attachment]) -> Vec<(String, &Attachment)> {
+    atts.iter()
         .map(|a| {
-            let dup = i
-                .attachments
+            let dup = atts
                 .iter()
                 .filter(|b| b.filename.eq_ignore_ascii_case(&a.filename))
                 .count()
@@ -1140,5 +1501,101 @@ mod tests {
         // max counts chars, not bytes
         assert_eq!(sanitize("日本語：テスト?", 5), "日本語：テ");
         assert_eq!(sanitize("件名/です。 ", 60), "件名_です。");
+    }
+
+    #[test]
+    fn wiki_disabled_hides_folder() {
+        let api = Api::new("http://127.0.0.1:9", "k").unwrap();
+        let meta = Meta {
+            wiki_enabled: false,
+            trackers: vec![IdName {
+                id: 1,
+                name: "Bug".into(),
+            }],
+            ..Default::default()
+        };
+        let fs = RedmineFs::new(api, meta, String::new());
+        let root: Vec<_> = fs
+            .read_dir("")
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(root, vec!["Bug"]);
+        assert_eq!(fs.stat("\\_wiki").unwrap_err(), E::NotFound);
+    }
+
+    #[test]
+    fn wiki_pending_folder_and_empty_buffer_guard() {
+        let api = Api::new("http://127.0.0.1:9", "k").unwrap();
+        let meta = Meta {
+            wiki_enabled: true,
+            trackers: vec![IdName {
+                id: 1,
+                name: "Bug".into(),
+            }],
+            ..Default::default()
+        };
+        let fs = RedmineFs::new(api, meta, String::new());
+        fs.lock().wiki_list = Some(WikiList {
+            checked: Some(Instant::now()),
+            pages: vec![WikiIndexEntry {
+                title: "Home".into(),
+                parent: None,
+                version: 1,
+                created_on: "2026-01-01T00:00:00Z".into(),
+                updated_on: "2026-01-01T00:00:00Z".into(),
+            }],
+        });
+        let root: Vec<_> = fs
+            .read_dir("")
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(root, vec!["_wiki", "Bug"]);
+
+        // Cannot create a pending folder with the same name as an existing wiki page
+        assert_eq!(fs.create("\\_wiki\\home", true).unwrap_err(), E::Exists);
+
+        // Create pending wiki folder -> page.md template appears inside
+        fs.create("\\_wiki\\DraftPage", true).unwrap();
+        fs.close("\\_wiki\\DraftPage");
+        let md = "\\_wiki\\DraftPage\\page.md";
+        let mut buf = vec![0u8; 256];
+        let n = fs.read(md, &mut buf, 0).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("parent:"));
+        assert!(text.contains("comments:"));
+
+        // Non-empty pending folder cannot be deleted; deleting page.md first lets it be deleted
+        assert_eq!(
+            fs.check_delete("\\_wiki\\DraftPage").unwrap_err(),
+            E::NotEmpty
+        );
+
+        // Truncating page.md to empty must not send to Redmine
+        fs.open(md).unwrap();
+        fs.set_size(md, 0, true).unwrap();
+        fs.cleanup(md, false);
+        fs.close(md);
+        assert!(fs.stat("\\_wiki\\DraftPage\\page.md.error.txt").is_err());
+
+        // Rename pending folder within _wiki (and reject collision with existing page)
+        assert_eq!(
+            fs.rename("\\_wiki\\DraftPage", "\\_wiki\\Home", false)
+                .unwrap_err(),
+            E::Exists
+        );
+        fs.rename("\\_wiki\\DraftPage", "\\_wiki\\RenamedPage", false)
+            .unwrap();
+        assert!(fs.stat("\\_wiki\\RenamedPage\\page.md").is_ok());
+
+        // Delete page.md then delete now-empty pending folder
+        fs.check_delete("\\_wiki\\RenamedPage\\page.md").unwrap();
+        fs.cleanup("\\_wiki\\RenamedPage\\page.md", true);
+        fs.check_delete("\\_wiki\\RenamedPage").unwrap();
+        fs.cleanup("\\_wiki\\RenamedPage", true);
+        assert!(fs.stat("\\_wiki\\RenamedPage").is_err());
     }
 }

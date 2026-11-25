@@ -1,5 +1,5 @@
-//! issue.md / comment_*.md <-> Redmine payloads.
-use crate::redmine::{IdName, Issue, Journal, Meta};
+//! issue.md / comment_*.md / page.md <-> Redmine payloads.
+use crate::redmine::{IdName, Issue, Journal, Meta, WikiPage};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use serde_json::{Map, Value as J, json};
@@ -134,6 +134,63 @@ pub fn render_comment(j: &Journal) -> String {
 
 pub fn parse_comment(text: &str) -> String {
     norm(split(text).1)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ParsedWiki {
+    pub parent: String,
+    pub comments: String,
+    pub version: Option<u64>,
+    pub text: String,
+}
+
+pub fn render_wiki(p: &WikiPage) -> String {
+    let ed = vec![
+        ("parent", y(p.parent.as_ref().map(|x| &x.title))),
+        ("comments", Y::Null),
+    ];
+    let ro = vec![
+        ("title", y(&p.title)),
+        ("version", y(p.version)),
+        ("author", y(&p.author.name)),
+        ("created_on", y(&p.created_on)),
+        ("updated_on", y(&p.updated_on)),
+    ];
+    format!("---\n{}{RO_MARK}{}---\n{}", yaml(ed), yaml(ro), p.text)
+}
+
+/// page.md placed in a freshly created wiki folder.
+pub fn wiki_template() -> String {
+    let ed = vec![("parent", Y::Null), ("comments", Y::Null)];
+    format!("---\n{}---\n", yaml(ed))
+}
+
+pub fn parse_wiki(text: &str) -> Result<ParsedWiki> {
+    let (fm, body) = split(text);
+    let m: Mapping = match fm {
+        Some(f) => serde_yaml::from_str::<Option<Mapping>>(f)?.unwrap_or_default(),
+        None => Mapping::new(),
+    };
+    let g = |k: &str| m.get(k).map(scalar).unwrap_or_default();
+    let ver = g("version");
+    let version = if ver.is_empty() {
+        None
+    } else {
+        Some(
+            ver.parse::<u64>()
+                .map_err(|_| anyhow!("version: '{ver}' must be a number"))?,
+        )
+    };
+    Ok(ParsedWiki {
+        parent: g("parent"),
+        comments: g("comments"),
+        version,
+        text: norm(body),
+    })
+}
+
+pub fn norm_text(s: &str) -> String {
+    norm(s)
 }
 
 /// Splits `---` front matter from the body.
@@ -397,5 +454,56 @@ mod tests {
             "こんにちは",
             "front matterなし",
         );
+    }
+
+    fn check_wiki_roundtrip(title: &str, parent: &str, body: &str, comment: &str) {
+        let p: WikiPage = serde_json::from_value(json!({
+            "title": title,
+            "parent": { "title": parent },
+            "text": body,
+            "version": 4,
+            "author": { "id": 1, "name": "Admin" },
+            "comments": "old edit",
+            "created_on": "2026-11-01T10:00:00Z",
+            "updated_on": "2026-11-20T09:00:00Z"
+        }))
+        .unwrap();
+
+        let rendered = render_wiki(&p);
+        let parsed = parse_wiki(&rendered).unwrap();
+        assert_eq!(parsed.parent, parent);
+        assert_eq!(parsed.comments, "");
+        assert_eq!(parsed.version, Some(4));
+        assert_eq!(parsed.text, norm_text(body));
+
+        let edited = rendered.replace("comments:", &format!("comments: {comment}"));
+        let parsed2 = parse_wiki(&edited).unwrap();
+        assert_eq!(parsed2.comments, comment);
+
+        // plain markdown without front matter
+        let plain = parse_wiki("# Heading\r\nBody\r\n").unwrap();
+        assert_eq!(plain.parent, "");
+        assert_eq!(plain.comments, "");
+        assert_eq!(plain.version, None);
+        assert_eq!(plain.text, "# Heading\nBody");
+
+        // template parses cleanly
+        let tpl = parse_wiki(&wiki_template()).unwrap();
+        assert_eq!(tpl.parent, "");
+        assert_eq!(tpl.comments, "");
+        assert_eq!(tpl.version, None);
+        assert_eq!(tpl.text, "");
+
+        assert!(parse_wiki("---\nversion: abc\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn wiki_roundtrip() {
+        check_wiki_roundtrip("Getting_Started", "Wiki", "Hello\r\nWorld\r\n", "Fix typo");
+    }
+
+    #[test]
+    fn wiki_roundtrip_multibyte() {
+        check_wiki_roundtrip("手順書", "ホーム", "見出し\r\n本文\r\n", "誤字修正");
     }
 }

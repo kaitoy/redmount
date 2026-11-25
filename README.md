@@ -1,6 +1,6 @@
 # redmount
 
-Mounts a single Redmine project as a drive (Windows) or a directory (Linux/macOS) so you can read and write issues as files. Built on WinFsp on Windows and FUSE elsewhere.
+Mounts a single Redmine project as a drive (Windows) or a directory (Linux/macOS) so you can read and write issues and wiki pages as files. Built on WinFsp on Windows and FUSE elsewhere.
 
 ## Requirements
 - Windows: [WinFsp](https://winfsp.dev/) 2.1 or later; to build, Rust (MSVC toolchain) and Visual Studio Build Tools ("Desktop development with C++")
@@ -32,6 +32,8 @@ R:\Bug\123 Login fails\issue.md          Fields (front matter) + description
 R:\Bug\123 Login fails\comment_456.md    One file per comment
 R:\Bug\123 Login fails\attachments\      Attachments
 R:\Bug\_closed\98 Old crash\             Closed issues (the tracker folder lists open ones only)
+R:\_wiki\Wiki\page.md                    Wiki page (front matter + body, when wiki module is enabled)
+R:\_wiki\Wiki\attachments\               Wiki page attachments
 ```
 Folders are resolved by their leading ID, so `R:\Bug\123` works too, whether or not the issue is listed there.
 
@@ -47,11 +49,14 @@ A file is sent to Redmine when it is saved and closed. Editors that save by writ
 | Create and save `comment.md` in an issue folder | Adds a comment; the file is replaced by `comment_N.md` |
 | Copy a file into `attachments\` | Attaches it |
 | Create a new folder in a tracker folder, fill in the `issue.md` template inside, and save | Creates an issue (the folder name is used if subject is empty) |
+| Edit and save `page.md` in `_wiki\<Title>\` | Updates the wiki page (`parent`, `comments`, body) |
+| Create a new folder in `_wiki\`, fill in `page.md` inside, and save | Creates a wiki page named after the folder |
+| Copy a file into `_wiki\<Title>\attachments\` | Attaches it to the wiki page |
 
 - If sending fails (validation error, conflict, etc.), the reason is written to `<file name>.error.txt`. Your edits stay on the drive, so you can fix them and save again.
-- Deleting an unsent `issue.md` or comment discards those edits.
+- Deleting an unsent `issue.md`, `page.md`, or comment discards those edits.
 - Other files (editor temp files, `.md` files with other names, etc.) are kept in memory only and never sent to Redmine. They disappear on unmount.
-- Issues, comments and attachments cannot be deleted.
+- Issues, comments, wiki pages, and attachments cannot be deleted.
 
 ## Agent Skill
 [`skills/redmount/`](skills/redmount/SKILL.md) is an [Agent Skill](https://agentskills.io/) that teaches AI agents the rules above. This repository is also a plugin and a plugin marketplace that ship it:

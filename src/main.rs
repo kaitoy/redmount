@@ -55,12 +55,17 @@ fn main() -> anyhow::Result<()> {
     let meta = api.meta(&args.project)?;
     let trackers: Vec<_> = meta.trackers.iter().map(|t| t.name.as_str()).collect();
     log!(
-        "project #{} trackers: {} ({} users, {} statuses, {} versions)",
+        "project #{} trackers: {} ({} users, {} statuses, {} versions, wiki: {})",
         meta.project_id,
         trackers.join(", "),
         meta.users.len(),
         meta.statuses.len(),
-        meta.versions.len()
+        meta.versions.len(),
+        if meta.wiki_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     let fs = fs::RedmineFs::new(api, meta, args.filter.trim_matches('&').to_string());
     #[cfg(windows)]

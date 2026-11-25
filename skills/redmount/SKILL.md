@@ -1,6 +1,6 @@
 ---
 name: redmount
-description: Use when reading, searching, creating, updating, closing or commenting on Redmine issues through a redmount-mounted drive or directory (e.g. `R:\`, `~/redmine`), where each issue is a folder holding `issue.md` and `comment_N.md` files.
+description: Use when reading, searching, creating, updating, closing or commenting on Redmine issues, or reading/creating/updating Redmine wiki pages through a redmount-mounted drive or directory (e.g. `R:\`, `~/redmine`), where each issue is a folder holding `issue.md` and `comment_N.md` and each wiki page is under `_wiki\<Title>\page.md`.
 ---
 
 # Operating Redmine through redmount
@@ -16,6 +16,8 @@ If you don't know the mount path, ask the user. Don't start or stop redmount you
 <mount>\<tracker>\<id> <subject>\comment_<N>.md     One file per existing comment
 <mount>\<tracker>\<id> <subject>\attachments\       Attachments
 <mount>\<tracker>\_closed\<id> <subject>\           Closed issues
+<mount>\_wiki\<title>\page.md                       Wiki page (front matter + body, if wiki enabled)
+<mount>\_wiki\<title>\attachments\                  Wiki page attachments
 ```
 
 - A tracker folder lists open issues only; closed ones are under `_closed`.
@@ -55,6 +57,26 @@ Description in Markdown/Textile, as Redmine stores it.
 - An empty value clears the field. Dates are `YYYY-MM-DD`. Custom field names must match exactly (case-sensitive); multi-value custom fields take a YAML list.
 - `updated_on` is used for conflict detection. Leave it as you read it. See the conflict rules below.
 
+## page.md format (Wiki)
+
+```markdown
+---
+parent: Wiki
+comments:
+# --- Read-only below (edits are ignored) ---
+title: Getting_Started
+version: 3
+author: John Smith
+created_on: ...
+updated_on: 2026-01-10T09:00:00Z
+---
+Page body in Markdown/Textile, as Redmine stores it.
+```
+
+- `parent` is the optional parent page title (empty clears the parent).
+- `comments` is an optional revision comment for this edit (always rendered empty on read).
+- `version` is used for conflict detection. Leave it as you read it. See the conflict rules below.
+
 ## Operations
 
 | Goal | Do this |
@@ -63,24 +85,27 @@ Description in Markdown/Textile, as Redmine stores it.
 | Close / change status | Set `status:` to the target status. A closed issue moves under `_closed`. |
 | Add a comment | Write a new file `comment.md` in the issue folder with the comment text (no front matter needed). After sending it is replaced by `comment_<N>.md`. |
 | Edit a comment | Edit the body of `comment_<N>.md` (Redmine 5.0+). |
-| Attach a file | Copy the file into the issue's `attachments\` folder. |
+| Attach a file to an issue | Copy the file into the issue's `attachments\` folder. |
 | Create an issue | Create a new folder in the tracker folder (e.g. `<mount>\Bug\new-login-bug`), read the `issue.md` template that appears inside, fill it in, save. If `subject` is empty the folder name is used. The folder path keeps working afterwards; re-read its `issue.md` to get the new `id`. |
+| Update a wiki page | Read `_wiki\<title>\page.md`, edit it in place, save. |
+| Create a wiki page | Create a new folder in `_wiki\` (e.g. `<mount>\_wiki\Design_Doc`), fill in the `page.md` template inside, save. The folder name becomes the page title. |
+| Attach a file to a wiki page | Copy the file into `_wiki\<title>\attachments\`. |
 
-Write each file once with the full content. Every save of `issue.md` or `comment.md` sends to Redmine, so don't build them up with several partial writes.
+Write each file once with the full content. Every save of `issue.md`, `comment.md`, or `page.md` sends to Redmine, so don't build them up with several partial writes.
 
 ## After every write: check for errors
 
-Saving blocks until Redmine answers. Then check whether `<file name>.error.txt` exists next to the file you wrote (e.g. `issue.md.error.txt`, `comment.md.error.txt`):
+Saving blocks until Redmine answers. Then check whether `<file name>.error.txt` exists next to the file you wrote (e.g. `issue.md.error.txt`, `comment.md.error.txt`, `page.md.error.txt`):
 
 - **No error file**: sent. Re-read the file to confirm the result if it matters.
 - **Error file exists**: read it, fix the cause in the same file and save again. Your edits stay on the drive until they are sent; the error file disappears on success.
-- **Conflict** (someone else updated the issue while you were editing): the error message tells you how to overwrite by changing `updated_on`. **Do not follow that instruction on your own.** Overwriting silently discards the other person's changes. Instead, either:
-  1. Re-apply: delete your `issue.md` to discard your unsent edits, re-read it, check what the other person changed, and make your change again on the fresh text; or
-  2. Ask the user, showing what conflicts, and change `updated_on` only if they explicitly tell you to overwrite.
+- **Conflict** (someone else updated the issue or wiki page while you were editing): the error message tells you how to overwrite by changing `updated_on` (issues) or `version` (wiki). **Do not follow that instruction on your own.** Overwriting silently discards the other person's changes. Instead, either:
+  1. Re-apply: delete your `issue.md` / `page.md` to discard your unsent edits, re-read it, check what the other person changed, and make your change again on the fresh text; or
+  2. Ask the user, showing what conflicts, and change `updated_on` / `version` only if they explicitly tell you to overwrite.
 
 ## Don't
 
-- Don't create scratch or note files in the mount expecting them to be saved: any file other than `issue.md`, `comment.md`, `comment_<N>.md` and attachments is kept in memory only and lost on unmount.
-- Don't try to delete issues, comments or attachments; it isn't supported. Deleting an `issue.md` or comment with unsent edits just discards those edits.
-- Don't edit the read-only section; it is ignored. The one exception is changing `updated_on` to overwrite after a conflict, and only when the user explicitly asks for it.
-- Don't edit `issue.md` from a stale copy. Read it right before editing so `updated_on` is current.
+- Don't create scratch or note files in the mount expecting them to be saved: any file other than `issue.md`, `comment.md`, `comment_<N>.md`, `page.md` and attachments is kept in memory only and lost on unmount.
+- Don't try to delete issues, comments, wiki pages, or attachments; it isn't supported. Deleting an `issue.md`, `page.md`, or comment with unsent edits just discards those edits.
+- Don't edit the read-only section; it is ignored. The one exception is changing `updated_on` / `version` to overwrite after a conflict, and only when the user explicitly asks for it.
+- Don't edit `issue.md` or `page.md` from a stale copy. Read it right before editing so `updated_on` / `version` is current.

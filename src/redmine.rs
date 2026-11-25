@@ -65,11 +65,45 @@ pub struct Issue {
     pub attachments: Vec<Attachment>,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+pub struct WikiParent {
+    pub title: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct WikiIndexEntry {
+    pub title: String,
+    #[allow(dead_code)]
+    pub parent: Option<WikiParent>,
+    #[allow(dead_code)]
+    pub version: u64,
+    pub created_on: String,
+    pub updated_on: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct WikiPage {
+    pub title: String,
+    pub parent: Option<WikiParent>,
+    #[serde(default)]
+    pub text: String,
+    pub version: u64,
+    pub author: IdName,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub comments: Option<String>,
+    pub created_on: String,
+    pub updated_on: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
 /// Name <-> id tables, loaded once at mount.
 // ponytail: loaded once; restart to pick up new members/versions.
 #[derive(Default, Debug)]
 pub struct Meta {
     pub project_id: u64,
+    pub wiki_enabled: bool,
     pub trackers: Vec<IdName>,
     pub statuses: Vec<IdName>,
     pub closed_statuses: Vec<u64>,
@@ -139,6 +173,8 @@ impl Api {
             issue_categories: Vec<IdName>,
             #[serde(default)]
             issue_custom_fields: Vec<IdName>,
+            #[serde(default)]
+            enabled_modules: Vec<IdName>,
         }
         #[derive(Deserialize)]
         struct P {
@@ -175,7 +211,7 @@ impl Api {
         }
 
         let p: P = self.get(&format!(
-            "/projects/{project}.json?include=trackers,issue_categories,issue_custom_fields"
+            "/projects/{project}.json?include=trackers,issue_categories,issue_custom_fields,enabled_modules"
         ))?;
         let users = self
             .paged(&format!("/projects/{project}/memberships.json"), |m: Ms| {
@@ -187,6 +223,7 @@ impl Api {
         let st = self.get::<S>("/issue_statuses.json")?.issue_statuses;
         Ok(Meta {
             project_id: p.project.id,
+            wiki_enabled: p.project.enabled_modules.iter().any(|m| m.name == "wiki"),
             trackers: p.project.trackers,
             categories: p.project.issue_categories,
             custom_fields: p.project.issue_custom_fields,
@@ -270,5 +307,77 @@ impl Api {
 
     pub fn download(&self, url: &str) -> Result<Vec<u8>> {
         Ok(Self::check(self.http.get(url).send()?)?.bytes()?.to_vec())
+    }
+
+    pub fn wiki_index(&self, project_id: u64) -> Result<Vec<WikiIndexEntry>> {
+        #[derive(Deserialize)]
+        struct W {
+            wiki_pages: Vec<WikiIndexEntry>,
+        }
+        let r = self
+            .http
+            .get(format!(
+                "{}/projects/{project_id}/wiki/index.json",
+                self.base
+            ))
+            .send()?;
+        if matches!(r.status().as_u16(), 403 | 404) {
+            return Ok(Vec::new());
+        }
+        Ok(Self::check(r)?.json::<W>()?.wiki_pages)
+    }
+
+    pub fn wiki_page(&self, project_id: u64, title: &str) -> Result<Option<WikiPage>> {
+        #[derive(Deserialize)]
+        struct W {
+            wiki_page: WikiPage,
+        }
+        let r = self
+            .http
+            .get(format!(
+                "{}/projects/{project_id}/wiki/{}.json?include=attachments",
+                self.base,
+                encode_segment(title)
+            ))
+            .send()?;
+        if matches!(r.status().as_u16(), 403 | 404) {
+            return Ok(None);
+        }
+        Ok(Some(Self::check(r)?.json::<W>()?.wiki_page))
+    }
+
+    pub fn put_wiki_page(&self, project_id: u64, title: &str, body: Value) -> Result<Value> {
+        self.send(
+            Method::PUT,
+            &format!("/projects/{project_id}/wiki/{}.json", encode_segment(title)),
+            Some(body),
+        )
+    }
+}
+
+/// Percent-encodes a single URL path segment (also encodes `.` so Rails format routing is unambiguous).
+fn encode_segment(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_wiki_segment() {
+        assert_eq!(encode_segment("Getting_Started"), "Getting_Started");
+        assert_eq!(encode_segment("My Page"), "My%20Page");
+        assert_eq!(encode_segment("v1.0/a?b#c%d"), "v1%2E0%2Fa%3Fb%23c%25d");
+        assert_eq!(encode_segment("日本語"), "%E6%97%A5%E6%9C%AC%E8%AA%9E");
     }
 }

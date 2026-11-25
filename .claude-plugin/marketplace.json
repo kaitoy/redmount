@@ -6,8 +6,8 @@
     {
       "name": "redmount",
       "source": "./",
-      "version": "0.1.0",
-      "description": "Agent Skill for reading and editing Redmine issues through a redmount-mounted drive or directory.",
+      "version": "0.2.0",
+      "description": "Agent Skill for reading and editing Redmine issues and wiki pages through a redmount-mounted drive or directory.",
       "license": "GPL-3.0-or-later",
       "homepage": "https://github.com/kaitoy/redmount"
     }
