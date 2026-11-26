@@ -111,7 +111,7 @@ pub fn render_issue(i: &Issue, meta: &Meta) -> String {
         "---\n{}{RO_MARK}{}---\n{}",
         yaml(editable(Some(i), meta)),
         yaml(ro),
-        i.description.as_deref().unwrap_or("")
+        i.description.as_deref().unwrap_or("").replace("\r\n", "\n")
     )
 }
 
@@ -128,7 +128,7 @@ pub fn render_comment(j: &Journal) -> String {
     format!(
         "---\n{RO_MARK}{}---\n{}",
         yaml(ro),
-        j.notes.as_deref().unwrap_or("")
+        j.notes.as_deref().unwrap_or("").replace("\r\n", "\n")
     )
 }
 
@@ -156,7 +156,12 @@ pub fn render_wiki(p: &WikiPage) -> String {
         ("created_on", y(&p.created_on)),
         ("updated_on", y(&p.updated_on)),
     ];
-    format!("---\n{}{RO_MARK}{}---\n{}", yaml(ed), yaml(ro), p.text)
+    format!(
+        "---\n{}{RO_MARK}{}---\n{}",
+        yaml(ed),
+        yaml(ro),
+        p.text.replace("\r\n", "\n")
+    )
 }
 
 /// page.md placed in a freshly created wiki folder.

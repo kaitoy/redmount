@@ -46,6 +46,7 @@ fn io(e: anyhow::Error) -> E {
 /// File attributes; times in FILETIME units.
 #[derive(Clone, Copy, Debug)]
 pub struct Stat {
+    pub ino: u64,
     pub dir: bool,
     pub size: u64,
     pub created: u64,
@@ -534,21 +535,22 @@ impl RedmineFs {
     }
 
     fn info(&self, st: &mut State, node: &Node, key: &str) -> Res<Stat> {
+        let ino = file_id(key);
         if let Some(e) = st.local.get(key) {
-            return Ok(finfo(e.dir, e.data.len() as u64, e.time, e.time));
+            return Ok(finfo(ino, e.dir, e.data.len() as u64, e.time, e.time));
         }
         Ok(match node {
             Node::Root | Node::Tracker(_) | Node::Closed(_) | Node::WikiRoot => {
-                finfo(true, 0, self.started, self.started)
+                finfo(ino, true, 0, self.started, self.started)
             }
             Node::IssueDir(id) | Node::AttachDir(id) => {
                 let i = self.must_issue(st, *id)?;
-                finfo(true, 0, ft(&i.created_on), ft(&i.updated_on))
+                finfo(ino, true, 0, ft(&i.created_on), ft(&i.updated_on))
             }
             Node::IssueMd(id) => {
                 let len = self.render(st, node)?.len() as u64;
                 let i = self.must_issue(st, *id)?;
-                finfo(false, len, ft(&i.created_on), ft(&i.updated_on))
+                finfo(ino, false, len, ft(&i.created_on), ft(&i.updated_on))
             }
             Node::Comment(id, j) => {
                 let len = self.render(st, node)?.len() as u64;
@@ -558,13 +560,13 @@ impl RedmineFs {
                     .iter()
                     .find(|x| x.id == *j)
                     .map_or(EPOCH, |x| ft(&x.created_on));
-                finfo(false, len, t, t)
+                finfo(ino, false, len, t, t)
             }
             Node::Attachment(id, att) => {
                 let i = self.must_issue(st, *id)?;
                 let a = i.attachments.iter().find(|a| a.id == *att).ok_or_else(nf)?;
                 let t = ft(&a.created_on);
-                finfo(false, a.filesize, t, t)
+                finfo(ino, false, a.filesize, t, t)
             }
             Node::WikiDir(title) | Node::WikiAttachDir(title) => {
                 if let Some(p) = st
@@ -572,22 +574,22 @@ impl RedmineFs {
                     .as_ref()
                     .and_then(|l| l.pages.iter().find(|p| p.title.eq_ignore_ascii_case(title)))
                 {
-                    finfo(true, 0, ft(&p.created_on), ft(&p.updated_on))
+                    finfo(ino, true, 0, ft(&p.created_on), ft(&p.updated_on))
                 } else {
                     let p = self.must_wiki_page(st, title)?;
-                    finfo(true, 0, ft(&p.created_on), ft(&p.updated_on))
+                    finfo(ino, true, 0, ft(&p.created_on), ft(&p.updated_on))
                 }
             }
             Node::WikiMd(title) => {
                 let len = self.render(st, node)?.len() as u64;
                 let p = self.must_wiki_page(st, title)?;
-                finfo(false, len, ft(&p.created_on), ft(&p.updated_on))
+                finfo(ino, false, len, ft(&p.created_on), ft(&p.updated_on))
             }
             Node::WikiAttachment(title, att) => {
                 let p = self.must_wiki_page(st, title)?;
                 let a = p.attachments.iter().find(|a| a.id == *att).ok_or_else(nf)?;
                 let t = ft(&a.created_on);
-                finfo(false, a.filesize, t, t)
+                finfo(ino, false, a.filesize, t, t)
             }
             Node::Pending(_) | Node::WikiPending | Node::Local => return Err(nf()),
         })
@@ -596,15 +598,27 @@ impl RedmineFs {
     fn list_dir(&self, st: &mut State, node: &Node, key: &str) -> Res<Vec<(String, Stat)>> {
         let mut out: Vec<(String, Stat)> = match node {
             Node::Root => {
-                let fi = finfo(true, 0, self.started, self.started);
                 let mut v: Vec<_> = self
                     .meta
                     .trackers
                     .iter()
-                    .map(|t| (sanitize(&t.name, 100), fi))
+                    .map(|t| {
+                        let name = sanitize(&t.name, 100);
+                        let ino = file_id(&format!("\\{}", name.to_lowercase()));
+                        (name, finfo(ino, true, 0, self.started, self.started))
+                    })
                     .collect();
                 if self.meta.wiki_enabled {
-                    v.push((WIKI.to_string(), fi));
+                    v.push((
+                        WIKI.to_string(),
+                        finfo(
+                            file_id(&format!("\\{WIKI}")),
+                            true,
+                            0,
+                            self.started,
+                            self.started,
+                        ),
+                    ));
                 }
                 v
             }
@@ -616,14 +630,26 @@ impl RedmineFs {
                     .map(|i| {
                         (
                             folder(i),
-                            finfo(true, 0, ft(&i.created_on), ft(&i.updated_on)),
+                            finfo(
+                                file_id(&format!("#{}", i.id)),
+                                true,
+                                0,
+                                ft(&i.created_on),
+                                ft(&i.updated_on),
+                            ),
                         )
                     })
                     .collect();
                 if !closed {
                     v.push((
                         CLOSED.to_string(),
-                        finfo(true, 0, self.started, self.started),
+                        finfo(
+                            file_id(&format!("{key}\\{CLOSED}")),
+                            true,
+                            0,
+                            self.started,
+                            self.started,
+                        ),
                     ));
                 }
                 v
@@ -638,7 +664,7 @@ impl RedmineFs {
                     ),
                     (
                         "attachments".to_string(),
-                        self.info(st, &Node::AttachDir(id), "")?,
+                        self.info(st, &Node::AttachDir(id), &format!("#{id}\\attachments"))?,
                     ),
                 ];
                 for j in i.journals.iter().filter(|j| has_notes(j)) {
@@ -656,7 +682,8 @@ impl RedmineFs {
                     .into_iter()
                     .map(|(n, a)| {
                         let t = ft(&a.created_on);
-                        (n, finfo(false, a.filesize, t, t))
+                        let ino = file_id(&format!("{key}\\{}", n.to_lowercase()));
+                        (n, finfo(ino, false, a.filesize, t, t))
                     })
                     .collect()
             }
@@ -666,7 +693,13 @@ impl RedmineFs {
                 .map(|p| {
                     (
                         sanitize(&p.title, 100),
-                        finfo(true, 0, ft(&p.created_on), ft(&p.updated_on)),
+                        finfo(
+                            file_id(&format!("wiki:{}", p.title.to_lowercase())),
+                            true,
+                            0,
+                            ft(&p.created_on),
+                            ft(&p.updated_on),
+                        ),
                     )
                 })
                 .collect(),
@@ -684,7 +717,11 @@ impl RedmineFs {
                     ),
                     (
                         "attachments".to_string(),
-                        self.info(st, &Node::WikiAttachDir(title.clone()), "")?,
+                        self.info(
+                            st,
+                            &Node::WikiAttachDir(title.clone()),
+                            &format!("{wkey}\\attachments"),
+                        )?,
                     ),
                 ]
             }
@@ -694,7 +731,8 @@ impl RedmineFs {
                     .into_iter()
                     .map(|(n, a)| {
                         let t = ft(&a.created_on);
-                        (n, finfo(false, a.filesize, t, t))
+                        let ino = file_id(&format!("{key}\\{}", n.to_lowercase()));
+                        (n, finfo(ino, false, a.filesize, t, t))
                     })
                     .collect()
             }
@@ -1058,20 +1096,13 @@ impl RedmineFs {
             ) => {}
             _ => return Err(E::Denied),
         }
-        let lname = name.to_lowercase();
-        let key = format!("{pkey}\\{lname}");
-        if st.local.contains_key(&key)
-            || (matches!(pnode, Node::Tracker(_)) && name.eq_ignore_ascii_case(CLOSED))
-            || (matches!(pnode, Node::WikiRoot)
-                && (st.wiki_aliases.contains_key(&key)
-                    || st.wiki_list.as_ref().is_some_and(|l| {
-                        l.pages
-                            .iter()
-                            .any(|p| sanitize(&p.title, 100).to_lowercase() == lname)
-                    })))
-        {
+        // Reject creating any file or folder that already exists (including existing issues,
+        // _closed, wiki pages, and local entries) so `mkdir -p` never shadows a real issue folder.
+        if self.resolve(&mut st, path)?.is_some() {
             return Err(E::Exists);
         }
+        let lname = name.to_lowercase();
+        let key = format!("{pkey}\\{lname}");
         let mut e = Entry::new(name, dir, Vec::new(), false);
         e.opens = 1;
         st.local.insert(key.clone(), e);
@@ -1285,10 +1316,10 @@ fn local_children(st: &State, key: &str) -> Vec<(String, Stat)> {
         .range(prefix.clone()..)
         .take_while(|(k, _)| k.starts_with(&prefix))
         .filter(|(k, _)| !k[prefix.len()..].contains('\\'))
-        .map(|(_, e)| {
+        .map(|(k, e)| {
             (
                 e.name.clone(),
-                finfo(e.dir, e.data.len() as u64, e.time, e.time),
+                finfo(file_id(k), e.dir, e.data.len() as u64, e.time, e.time),
             )
         })
         .collect()
@@ -1369,8 +1400,19 @@ fn att_names(atts: &[Attachment]) -> Vec<(String, &Attachment)> {
         .collect()
 }
 
-fn finfo(dir: bool, size: u64, created: u64, modified: u64) -> Stat {
+/// Stable non-zero 64-bit file ID derived from a normalized overlay key (FNV-1a).
+fn file_id(key: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h.max(1)
+}
+
+fn finfo(ino: u64, dir: bool, size: u64, created: u64, modified: u64) -> Stat {
     Stat {
+        ino,
         dir,
         size,
         created,
@@ -1597,5 +1639,62 @@ mod tests {
         fs.check_delete("\\_wiki\\RenamedPage").unwrap();
         fs.cleanup("\\_wiki\\RenamedPage", true);
         assert!(fs.stat("\\_wiki\\RenamedPage").is_err());
+    }
+
+    /// `mkdir -p` on an existing issue folder must return E::Exists instead of creating a
+    /// pending folder that shadows the real issue and breaks `comment.md` writes.
+    #[test]
+    fn create_dir_does_not_shadow_existing_issue_and_ino_is_distinct() {
+        let api = Api::new("http://127.0.0.1:9", "k").unwrap();
+        let meta = Meta {
+            trackers: vec![IdName {
+                id: 1,
+                name: "Bug".into(),
+            }],
+            ..Default::default()
+        };
+        let fs = RedmineFs::new(api, meta, String::new());
+        let issue: Issue = serde_json::from_value(json!({
+            "id": 10,
+            "tracker": {"id": 1, "name": "Bug"},
+            "status": {"id": 1, "name": "New"},
+            "priority": {"id": 2, "name": "Normal"},
+            "author": {"id": 1, "name": "Admin"},
+            "subject": "Existing issue",
+            "description": "line1\r\n\r\nline2",
+            "created_on": "2026-01-01T00:00:00Z",
+            "updated_on": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        fs.lock().issues.insert(10, (Instant::now(), Some(issue)));
+
+        // Creating a directory with an existing issue ID must fail with E::Exists
+        assert_eq!(
+            fs.create("\\Bug\\10 Existing issue", true).unwrap_err(),
+            E::Exists
+        );
+        assert_eq!(fs.create("\\Bug\\10", true).unwrap_err(), E::Exists);
+
+        // Rendered issue.md normalizes CRLF -> LF so edit size verification stays consistent
+        let md = "\\Bug\\10 Existing issue\\issue.md";
+        let mut buf = vec![0u8; 1024];
+        let n = fs.read(md, &mut buf, 0).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(!text.contains("\r\n"));
+        assert!(text.contains("line1\n\nline2"));
+
+        // Distinct non-zero file IDs across root, tracker, issue dir, issue.md, attachments
+        let inos = [
+            fs.stat("").unwrap().ino,
+            fs.stat("\\Bug").unwrap().ino,
+            fs.stat("\\Bug\\10 Existing issue").unwrap().ino,
+            fs.stat(md).unwrap().ino,
+            fs.stat("\\Bug\\10 Existing issue\\attachments")
+                .unwrap()
+                .ino,
+        ];
+        assert!(inos.iter().all(|&x| x != 0));
+        let unique: std::collections::HashSet<u64> = inos.iter().copied().collect();
+        assert_eq!(unique.len(), inos.len());
     }
 }

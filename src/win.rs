@@ -48,6 +48,7 @@ fn fi(s: Stat) -> FileInfo {
         last_access_time: s.modified,
         last_write_time: s.modified,
         change_time: s.modified,
+        index_number: s.ino,
         ..Default::default()
     }
 }
@@ -192,8 +193,10 @@ impl FileSystemContext for WinFs {
         let path = h.path();
         let mut entries = self.fs.read_dir(&path)?;
         if !path.trim_matches('\\').is_empty() {
-            let me = self.fs.stat("")?;
-            entries.insert(0, ("..".to_string(), me));
+            let me = self.fs.stat(&path)?;
+            let parent_path = path.rsplit_once('\\').map_or("", |(p, _)| p);
+            let parent = self.fs.stat(parent_path)?;
+            entries.insert(0, ("..".to_string(), parent));
             entries.insert(0, (".".to_string(), me));
         }
         let start = match marker.inner_as_cstr() {
