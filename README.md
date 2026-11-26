@@ -68,6 +68,22 @@ A file is sent to Redmine when it is saved and closed. Editors that save by writ
 
 Then tell the agent where the drive is mounted.
 
+## Benchmark (vs. Redmine MCP Server)
+
+Because agents operate on mounted files with their built-in file tools (`Read`, `Edit`, `Write`, `Glob`, `Grep`) using display names directly—without loading dozens of MCP tool schemas or making extra calls to resolve tracker/status/priority/user/version IDs—`redmount` is more token- and cost-efficient than a Redmine MCP server.
+
+In a reproducible 7-scenario benchmark (filtered search, full-text search across descriptions and comments, issue update, comment reply, issue creation, 3-issue batch update, and wiki update; 3 trials each with Claude Code `sonnet`, 21/21 PASS for both) against [`@onozaty/redmine-mcp-server`](https://github.com/onozaty/redmine-mcp-server):
+
+| Metric (sum of scenario medians) | `redmount` | Redmine MCP | Ratio |
+|---|---:|---:|---:|
+| Pass rate | 100% (21/21) | 100% (21/21) | — |
+| Total cost (USD) | **$0.1977** | $0.2809 | **0.70x (-30%)** |
+| Cache creation tokens | **17,344** | 36,784 | **0.47x (-53%)** |
+| Total input + cache tokens | **759,419** | 788,108 | **0.96x** |
+| Total wall time | 77.58s | 72.27s | 1.07x |
+
+The advantage is largest on **issue creation** (`0.60x` wall time, `0.31x` cost), **filtered search** (`0.61x` wall time, `0.60x` cost), **full-text search** (`0.58x` cost), and **wiki updates** (`0.58x` wall time, `0.53x` cost). See [`bench/results/report.md`](bench/results/report.md) for the full breakdown and [`bench/README.md`](bench/README.md) to reproduce it locally.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE). The Windows build statically links [winfsp-rs](https://github.com/SnowflakePowered/winfsp-rs) (GPL-3.0).
