@@ -46,6 +46,8 @@ fn io(e: anyhow::Error) -> E {
 /// File attributes; times in FILETIME units.
 #[derive(Clone, Copy, Debug)]
 pub struct Stat {
+    /// Used by WinFsp (`index_number`); `fuse_mt` assigns inodes itself.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub ino: u64,
     pub dir: bool,
     pub size: u64,
